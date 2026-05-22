@@ -1,0 +1,16 @@
+# Token / secrets — never commit this
+mrs_protocol/config.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# PyInstaller output
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/

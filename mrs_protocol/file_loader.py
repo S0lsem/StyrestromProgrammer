@@ -1,7 +1,3 @@
-# mrs_protocol/file_loader.py
-# Loads and validates files required for MRS PLC programming
-# Expected files: usercode.c, usercode.h, candb.c, candb.h, Dsl_cfg (optional)
-
 from __future__ import annotations
 
 import os
@@ -15,11 +11,12 @@ from .protocol import FlashFile
 @dataclass
 class FileSlot:
     """Represents one expected file in the programming set."""
-    tag:       str              # Short label, e.g. "Usercode C"
-    filename:  str              # Expected filename (loosely matched)
-    required:  bool = True
-    data:      Optional[bytes] = None
-    path:      Optional[Path]  = None
+
+    tag: str
+    filename: str
+    required: bool = True
+    data: Optional[bytes] = None
+    path: Optional[Path] = None
 
     @property
     def loaded(self) -> bool:
@@ -39,17 +36,15 @@ class MRSFileSet:
     """
 
     SLOTS: list[dict] = [
-        {"tag": "Usercode C",   "filename": "usercode.c",  "required": True},
-        {"tag": "Usercode H",   "filename": "usercode.h",  "required": True},
-        {"tag": "CAN DB C",     "filename": "candb.c",     "required": True},
-        {"tag": "CAN DB H",     "filename": "candb.h",     "required": True},
-        {"tag": "DSL Config",   "filename": "Dsl_cfg",     "required": False},
+        {'tag': 'Usercode C', 'filename': 'usercode.c', 'required': True},
+        {'tag': 'Usercode H', 'filename': 'usercode.h', 'required': True},
+        {'tag': 'CAN DB C',   'filename': 'candb.c',    'required': True},
+        {'tag': 'CAN DB H',   'filename': 'candb.h',    'required': True},
+        {'tag': 'DSL Config', 'filename': 'Dsl_cfg',    'required': False},
     ]
 
-    def __init__(self):
-        self._slots: list[FileSlot] = [
-            FileSlot(**s) for s in self.SLOTS
-        ]
+    def __init__(self) -> None:
+        self._slots = [FileSlot(**s) for s in self.SLOTS]
 
     @property
     def slots(self) -> list[FileSlot]:
@@ -78,16 +73,16 @@ class MRSFileSet:
         path = Path(path)
         name_lower = path.name.lower()
 
-        # Try exact match first, then partial
+        # Exact filename match (case-insensitive)
         for slot in self._slots:
             if slot.filename.lower() == name_lower:
                 slot.data = path.read_bytes()
                 slot.path = path
                 return slot
 
-        # Partial match fallback (e.g. "V1_0_4_usercode.c" → "usercode.c")
+        # Fuzzy stem match (strip .c/.h extension from slot filename)
         for slot in self._slots:
-            stem = slot.filename.lower().rstrip(".ch")
+            stem = slot.filename.lower().rstrip('.ch')
             if stem in name_lower:
                 slot.data = path.read_bytes()
                 slot.path = path
@@ -95,7 +90,34 @@ class MRSFileSet:
 
         raise ValueError(
             f"File '{path.name}' doesn't match any expected slot: "
-            + ", ".join(s.filename for s in self._slots)
+            + ', '.join(s.filename for s in self._slots)
+        )
+
+    def load_bytes(self, filename: str, data: bytes) -> FileSlot:
+        """
+        Load file content from an in-memory bytes object into the matching slot.
+        Uses the same matching logic as load_file (exact name first, then stem).
+
+        Raises ValueError if no matching slot found.
+        """
+        name_lower = filename.lower()
+
+        for slot in self._slots:
+            if slot.filename.lower() == name_lower:
+                slot.data = data
+                slot.path = None
+                return slot
+
+        for slot in self._slots:
+            stem = slot.filename.lower().rstrip('.ch')
+            if stem in name_lower:
+                slot.data = data
+                slot.path = None
+                return slot
+
+        raise ValueError(
+            f"File '{filename}' doesn't match any expected slot: "
+            + ', '.join(s.filename for s in self._slots)
         )
 
     def load_directory(self, directory: Path | str) -> list[FileSlot]:
@@ -120,7 +142,6 @@ class MRSFileSet:
             if slot.tag == tag:
                 slot.data = None
                 slot.path = None
-                return
 
     def clear_all(self) -> None:
         for slot in self._slots:
@@ -140,7 +161,7 @@ class MRSFileSet:
         errors = []
         for slot in self._slots:
             if slot.required and not slot.loaded:
-                errors.append(f"Required file missing: {slot.filename} ({slot.tag})")
+                errors.append(f'Required file missing: {slot.tag} ({slot.filename})')
             if slot.loaded and slot.size == 0:
-                errors.append(f"File is empty: {slot.filename}")
+                errors.append(f'File is empty: {slot.filename}')
         return errors

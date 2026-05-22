@@ -1,14 +1,8 @@
-# mrs_protocol/crc.py
-# Block checksum for MRS data stream
-# From TRC analysis: last byte of every 6-byte final chunk is a CRC over that block.
-# The exact algorithm is inferred — simple XOR-sum of all payload bytes in the block,
-# which matches the observed values. Adjust if a device rejects blocks.
-
-
 def block_checksum(data: bytes) -> int:
     """
     Compute the 1-byte checksum for a data block.
-    Algorithm: XOR of all payload bytes in the block (excluding the checksum byte itself).
+    Algorithm: XOR of all payload bytes in the block (excluding the checksum
+    byte itself).
 
     Args:
         data: raw payload bytes of the block (everything before the checksum byte)
