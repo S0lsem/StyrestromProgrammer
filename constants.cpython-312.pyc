@@ -1,0 +1,399 @@
+# mrs_protocol/protocol.py
+# MRS PLC flash protocol implementation
+# Reverse-engineered from Applix Studio PCAN trace (MRS Applics Flasher V0.9.4)
+# Styrestrøm AS — Internal tool
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Callable, Optional
+
+try:
+    import can
+    CAN_AVAILABLE = True
+except ImportError:
+    CAN_AVAILABLE = False
+
+from .constants import (
+    CAN_ID_PC_TO_PLC, CAN_ID_PLC_TO_PC, CAN_ID_PC_DATA,
+    HANDSHAKE_TX, HANDSHAKE_RX,
+    RESET_CMD, BOOT_TRIGGER, BOOT_DONE_PACKET,
+    DATA_HEADER_MAGIC, DATA_HEADER_ACK, DATA_CHUNK_ACK, DATA_FINAL_ACK,
+    DATA_OFFSET_INCREMENT,
+    TIMEOUT_HANDSHAKE, TIMEOUT_RESET_ACK, TIMEOUT_BOOT_ENUM,
+    TIMEOUT_BLOCK_ACK, TIMEOUT_CHUNK_ACK,
+    DEFAULT_CHANNEL, DEFAULT_BITRATE,
+)
+from .crc import block_checksum
+
+log = logging.getLogger(__name__)
+
+
+class FlashState(Enum):
+    IDLE         = auto()
+    HANDSHAKING  = auto()
+    RESETTING    = auto()
+    BOOT_WAIT    = auto()
+    PROGRAMMING  = auto()
+    DONE         = auto()
+    ERROR        = auto()
+
+
+@dataclass
+class FlashProgress:
+    """Passed to the progress callback on every meaningful state change."""
+    state:         FlashState
+    file_name:     str  = ""
+    file_index:    int  = 0
+    file_count:    int  = 0
+    blocks_done:   int  = 0
+    blocks_total:  int  = 0
+    packets_sent:  int  = 0
+    error_msg:     str  = ""
+    log_line:      str  = ""
+
+
+@dataclass
+class FlashFile:
+    """A file to be programmed into the PLC."""
+    name:    str
+    data:    bytes
+    # Optional: the offset byte pair used in the header.
+    # If None, computed automatically from block index.
+    base_offset: Optional[int] = None
+
+
+class MRSProtocolError(Exception):
+    """Raised when the PLC returns an unexpected response."""
+
+
+class MRSFlashEngine:
+    """
+    Implements the MRS PLC programming protocol over CAN.
+
+    Usage:
+        engine = MRSFlashEngine(channel="PCAN_USBBUS1", bitrate=250_000)
+        engine.add_file(FlashFile("usercode.c", data))
+        engine.flash(progress_callback=my_callback)
+    """
+
+    def __init__(
+        self,
+        channel:   str   = DEFAULT_CHANNEL,
+        bitrate:   int   = DEFAULT_BITRATE,
+        is_can_fd: bool  = False,
+    ):
+        self.channel   = channel
+        self.bitrate   = bitrate
+        self.is_can_fd = is_can_fd
+        self._bus: Optional[can.BusABC] = None
+        self._files: list[FlashFile] = []
+        self._state = FlashState.IDLE
+        self._abort = False
+        self._progress_cb: Optional[Callable[[FlashProgress], None]] = None
+        self._packets_sent = 0
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def add_file(self, flash_file: FlashFile) -> None:
+        """Register a file for programming. Call for each file before flash()."""
+        self._files.append(flash_file)
+        log.debug("Queued file: %s (%d bytes)", flash_file.name, len(flash_file.data))
+
+    def clear_files(self) -> None:
+        self._files.clear()
+
+    def abort(self) -> None:
+        """Request abort. The flash loop checks this flag between operations."""
+        self._abort = True
+
+    def flash(
+        self,
+        progress_callback: Optional[Callable[[FlashProgress], None]] = None,
+    ) -> bool:
+        """
+        Execute the full flash sequence.
+
+        Returns True on success, False on failure/abort.
+        The progress_callback receives a FlashProgress object on every step.
+        """
+        if not self._files:
+            raise ValueError("No files added. Call add_file() first.")
+
+        self._progress_cb = progress_callback
+        self._abort = False
+        self._packets_sent = 0
+
+        try:
+            self._open_bus()
+            self._phase_handshake()
+            self._phase_reset()
+            self._phase_handshake()          # re-handshake after reset
+            self._phase_handshake()          # second re-handshake (matches TRC)
+            self._phase_boot_trigger()
+            self._phase_boot_wait()
+            self._phase_final_handshake()    # two more handshakes before data (TRC shows this)
+            self._phase_final_handshake()
+            self._phase_program_files()
+            self._set_state(FlashState.DONE)
+            self._emit_log("[OK] Flash complete!")
+            return True
+
+        except MRSProtocolError as exc:
+            self._set_state(FlashState.ERROR, error_msg=str(exc))
+            self._emit_log(f"[ERR] Protocol error: {exc}")
+            return False
+
+        except Exception as exc:
+            if self._abort:
+                self._emit_log("[INFO] Flash aborted by user.")
+            else:
+                self._set_state(FlashState.ERROR, error_msg=str(exc))
+                self._emit_log(f"[ERR] Unexpected error: {exc}")
+                log.exception("Unexpected error during flash")
+            return False
+
+        finally:
+            self._close_bus()
+
+    # ------------------------------------------------------------------
+    # Bus management
+    # ------------------------------------------------------------------
+
+    def _open_bus(self) -> None:
+        if not CAN_AVAILABLE:
+            raise RuntimeError(
+                "python-can not installed. Run: pip install python-can"
+            )
+        self._emit_log(f"[INFO] Opening {self.channel} @ {self.bitrate // 1000} kbit/s")
+        self._bus = can.interface.Bus(
+            interface="pcan",
+            channel=self.channel,
+            bitrate=self.bitrate,
+            fd=self.is_can_fd,
+        )
+        self._emit_log(f"[OK] Adapter ready")
+
+    def _close_bus(self) -> None:
+        if self._bus:
+            try:
+                self._bus.shutdown()
+            except Exception:
+                pass
+            self._bus = None
+
+    # ------------------------------------------------------------------
+    # Protocol phases
+    # ------------------------------------------------------------------
+
+    def _phase_handshake(self) -> None:
+        self._set_state(FlashState.HANDSHAKING)
+        self._emit_log("[INFO] Sending handshake...")
+        self._send(CAN_ID_PC_TO_PLC, HANDSHAKE_TX)
+        rx = self._recv_timeout(TIMEOUT_HANDSHAKE, expected_id=CAN_ID_PLC_TO_PC)
+        if not rx.data[:6] == HANDSHAKE_RX:
+            raise MRSProtocolError(
+                f"Handshake failed. Expected {HANDSHAKE_RX.hex()}, got {bytes(rx.data[:6]).hex()}"
+            )
+        self._emit_log(f"[OK] Handshake ACK · device bytes: {bytes(rx.data[6:]).hex()}")
+
+    def _phase_reset(self) -> None:
+        self._set_state(FlashState.RESETTING)
+        self._emit_log("[INFO] Sending soft reset...")
+        self._send(CAN_ID_PC_TO_PLC, RESET_CMD)
+        rx = self._recv_timeout(TIMEOUT_RESET_ACK, expected_id=CAN_ID_PLC_TO_PC)
+        if rx.data[0] != 0x21:
+            raise MRSProtocolError(
+                f"Reset ACK unexpected: {bytes(rx.data).hex()}"
+            )
+        self._emit_log("[OK] Reset ACK received")
+
+    def _phase_boot_trigger(self) -> None:
+        self._emit_log("[INFO] Triggering boot enumeration...")
+        self._send(CAN_ID_PC_TO_PLC, BOOT_TRIGGER)
+
+    def _phase_boot_wait(self) -> None:
+        self._set_state(FlashState.BOOT_WAIT)
+        self._emit_log("[INFO] Waiting for boot enumeration...")
+        deadline = time.monotonic() + TIMEOUT_BOOT_ENUM
+        while time.monotonic() < deadline:
+            if self._abort:
+                raise InterruptedError("Aborted")
+            msg = self._bus.recv(timeout=0.5)
+            if msg is None:
+                continue
+            if msg.arbitration_id != CAN_ID_PLC_TO_PC:
+                continue
+            data = bytes(msg.data)
+            if data == BOOT_DONE_PACKET:
+                self._emit_log("[OK] Boot enumeration complete")
+                return
+            # Log intermediate enumeration packets at debug level
+            log.debug("Boot enum: %s", data.hex())
+        raise MRSProtocolError("Boot enumeration timed out — PLC did not send boot-done packet")
+
+    def _phase_final_handshake(self) -> None:
+        """Two extra handshakes observed in TRC before data stream begins."""
+        self._send(CAN_ID_PC_TO_PLC, HANDSHAKE_TX)
+        rx = self._recv_timeout(TIMEOUT_HANDSHAKE, expected_id=CAN_ID_PLC_TO_PC)
+        if not bytes(rx.data[:6]) == HANDSHAKE_RX:
+            raise MRSProtocolError(
+                f"Pre-data handshake failed: {bytes(rx.data).hex()}"
+            )
+        self._emit_log("[OK] Pre-data handshake OK")
+
+    def _phase_program_files(self) -> None:
+        self._set_state(FlashState.PROGRAMMING)
+        total = len(self._files)
+        for idx, flash_file in enumerate(self._files):
+            if self._abort:
+                raise InterruptedError("Aborted")
+            self._emit_log(f"[INFO] Programming {flash_file.name} ({len(flash_file.data)} bytes)...")
+            self._program_file(flash_file, file_index=idx, file_count=total)
+            self._emit_log(f"[OK] {flash_file.name} done")
+
+    # ------------------------------------------------------------------
+    # Data block programming
+    # ------------------------------------------------------------------
+
+    def _program_file(
+        self,
+        flash_file: FlashFile,
+        file_index: int,
+        file_count: int,
+    ) -> None:
+        """
+        Stream a file to the PLC in 29-byte blocks.
+
+        Block structure (as seen in TRC):
+          Header:  53 31 23 [offset_hi] [offset_lo] [data0..4]   (8 bytes Tx)
+                   ACK: 00 01 01 01 01                           (5 bytes Rx)
+          Chunk 1: [data5..12]                                    (8 bytes Tx)
+                   ACK: 00 01                                     (2 bytes Rx)
+          Chunk 2: [data13..20]                                   (8 bytes Tx)
+                   ACK: 00 01                                     (2 bytes Rx)
+          Chunk 3: [data21..28]                                   (8 bytes Tx)
+                   ACK: 00 01                                     (2 bytes Rx)
+          Final:   [data29..33] + [crc]                           (6 bytes Tx)
+                   ACK: 00 00 01                                  (3 bytes Rx)
+
+        Payload per block = 5 (header tail) + 8×3 (chunks) + 5 (final payload) = 34 bytes
+        plus 1 CRC = 35 transmitted payload bytes per block.
+        Pad the last block with 0x00 if needed.
+        """
+        data = flash_file.data
+        PAYLOAD_PER_BLOCK = 5 + 8 + 8 + 8 + 5  # = 34 bytes of actual data per block
+
+        # Pad to block boundary
+        remainder = len(data) % PAYLOAD_PER_BLOCK
+        if remainder:
+            data = data + bytes(PAYLOAD_PER_BLOCK - remainder)
+
+        blocks_total = len(data) // PAYLOAD_PER_BLOCK
+        offset = 0x2200 if flash_file.base_offset is None else flash_file.base_offset
+
+        for block_idx in range(blocks_total):
+            if self._abort:
+                raise InterruptedError("Aborted")
+
+            chunk_start = block_idx * PAYLOAD_PER_BLOCK
+            block_data  = data[chunk_start : chunk_start + PAYLOAD_PER_BLOCK]
+
+            offset_hi = (offset >> 8) & 0xFF
+            offset_lo = offset & 0xFF
+
+            # --- Header packet (8 bytes) ---
+            header_payload = block_data[0:5]
+            header_pkt = bytes(DATA_HEADER_MAGIC) + bytes([offset_hi, offset_lo]) + header_payload
+            self._send(CAN_ID_PC_DATA, header_pkt)
+            self._await_ack(DATA_HEADER_ACK, TIMEOUT_BLOCK_ACK, "header ACK")
+            self._packets_sent += 1
+
+            # --- Three 8-byte data chunks ---
+            for chunk_i in range(3):
+                pos   = 5 + chunk_i * 8
+                chunk = block_data[pos : pos + 8]
+                self._send(CAN_ID_PC_DATA, chunk)
+                self._await_ack(DATA_CHUNK_ACK, TIMEOUT_CHUNK_ACK, f"chunk {chunk_i+1} ACK")
+                self._packets_sent += 1
+
+            # --- Final 6-byte packet (5 bytes payload + 1 byte CRC) ---
+            final_payload = block_data[29:34]
+            crc_byte      = block_checksum(block_data)
+            final_pkt     = final_payload + bytes([crc_byte])
+            self._send(CAN_ID_PC_DATA, final_pkt)
+            self._await_ack(DATA_FINAL_ACK, TIMEOUT_CHUNK_ACK, "final ACK")
+            self._packets_sent += 1
+
+            # Advance offset
+            offset += DATA_OFFSET_INCREMENT
+
+            # Report progress
+            if self._progress_cb:
+                self._progress_cb(FlashProgress(
+                    state        = FlashState.PROGRAMMING,
+                    file_name    = flash_file.name,
+                    file_index   = file_index,
+                    file_count   = file_count,
+                    blocks_done  = block_idx + 1,
+                    blocks_total = blocks_total,
+                    packets_sent = self._packets_sent,
+                ))
+
+    # ------------------------------------------------------------------
+    # Low-level helpers
+    # ------------------------------------------------------------------
+
+    def _send(self, arb_id: int, data: bytes) -> None:
+        msg = can.Message(
+            arbitration_id=arb_id,
+            data=data,
+            is_extended_id=True,
+            is_fd=self.is_can_fd,
+        )
+        self._bus.send(msg)
+        log.debug("Tx  %08X  [%d]  %s", arb_id, len(data), data.hex(" ").upper())
+
+    def _recv_timeout(self, timeout: float, expected_id: Optional[int] = None) -> can.Message:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._abort:
+                raise InterruptedError("Aborted")
+            msg = self._bus.recv(timeout=min(0.1, deadline - time.monotonic()))
+            if msg is None:
+                continue
+            if expected_id is not None and msg.arbitration_id != expected_id:
+                log.debug("Ignoring CAN ID %08X (expected %08X)", msg.arbitration_id, expected_id)
+                continue
+            log.debug("Rx  %08X  [%d]  %s", msg.arbitration_id, len(msg.data), bytes(msg.data).hex(" ").upper())
+            return msg
+        raise MRSProtocolError(f"Timeout waiting for response (timeout={timeout}s)")
+
+    def _await_ack(self, expected: bytes, timeout: float, label: str) -> None:
+        rx = self._recv_timeout(timeout, expected_id=CAN_ID_PLC_TO_PC)
+        received = bytes(rx.data[:len(expected)])
+        if received != expected:
+            raise MRSProtocolError(
+                f"Bad ACK at {label}: expected {expected.hex()}, got {received.hex()}"
+            )
+
+    def _set_state(self, state: FlashState, error_msg: str = "") -> None:
+        self._state = state
+        if self._progress_cb:
+            self._progress_cb(FlashProgress(
+                state     = state,
+                error_msg = error_msg,
+            ))
+
+    def _emit_log(self, line: str) -> None:
+        log.info(line)
+        if self._progress_cb:
+            self._progress_cb(FlashProgress(
+                state    = self._state,
+                log_line = line,
+            ))

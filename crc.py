@@ -1,0 +1,22 @@
+[
+  "tests/test_protocol.py::TestCRC::test_empty_payload",
+  "tests/test_protocol.py::TestCRC::test_known_block_from_trc",
+  "tests/test_protocol.py::TestCRC::test_single_byte",
+  "tests/test_protocol.py::TestCRC::test_two_same_bytes_xor_to_zero",
+  "tests/test_protocol.py::TestCRC::test_verify_correct",
+  "tests/test_protocol.py::TestCRC::test_verify_wrong",
+  "tests/test_protocol.py::TestConstants::test_can_ids_are_29_bit",
+  "tests/test_protocol.py::TestConstants::test_handshake_first_byte_differs",
+  "tests/test_protocol.py::TestConstants::test_handshake_payload_length",
+  "tests/test_protocol.py::TestFileLoader::test_clear_all",
+  "tests/test_protocol.py::TestFileLoader::test_load_by_exact_name",
+  "tests/test_protocol.py::TestFileLoader::test_load_unknown_file_raises",
+  "tests/test_protocol.py::TestFileLoader::test_not_loaded_initially",
+  "tests/test_protocol.py::TestFileLoader::test_required_slots",
+  "tests/test_protocol.py::TestFileLoader::test_slots_defined",
+  "tests/test_protocol.py::TestFileLoader::test_to_flash_files_empty_when_no_files",
+  "tests/test_protocol.py::TestFileLoader::test_to_flash_files_order",
+  "tests/test_protocol.py::TestFileLoader::test_validation_errors_when_empty",
+  "tests/test_protocol.py::TestTrcParser::test_parse_trc_file",
+  "tests/test_protocol.py::TestTrcParser::test_timing"
+]

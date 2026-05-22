@@ -1,0 +1,146 @@
+# mrs_protocol/file_loader.py
+# Loads and validates files required for MRS PLC programming
+# Expected files: usercode.c, usercode.h, candb.c, candb.h, Dsl_cfg (optional)
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+from .protocol import FlashFile
+
+
+@dataclass
+class FileSlot:
+    """Represents one expected file in the programming set."""
+    tag:       str              # Short label, e.g. "Usercode C"
+    filename:  str              # Expected filename (loosely matched)
+    required:  bool = True
+    data:      Optional[bytes] = None
+    path:      Optional[Path]  = None
+
+    @property
+    def loaded(self) -> bool:
+        return self.data is not None
+
+    @property
+    def size(self) -> int:
+        return len(self.data) if self.data else 0
+
+
+class MRSFileSet:
+    """
+    Manages the set of files needed to program an MRS PLC.
+
+    Slot order matters — files are sent to the PLC in the order
+    they appear here (matching Applix Studio behavior).
+    """
+
+    SLOTS: list[dict] = [
+        {"tag": "Usercode C",   "filename": "usercode.c",  "required": True},
+        {"tag": "Usercode H",   "filename": "usercode.h",  "required": True},
+        {"tag": "CAN DB C",     "filename": "candb.c",     "required": True},
+        {"tag": "CAN DB H",     "filename": "candb.h",     "required": True},
+        {"tag": "DSL Config",   "filename": "Dsl_cfg",     "required": False},
+    ]
+
+    def __init__(self):
+        self._slots: list[FileSlot] = [
+            FileSlot(**s) for s in self.SLOTS
+        ]
+
+    @property
+    def slots(self) -> list[FileSlot]:
+        return self._slots
+
+    @property
+    def all_required_loaded(self) -> bool:
+        return all(s.loaded for s in self._slots if s.required)
+
+    @property
+    def loaded_count(self) -> int:
+        return sum(1 for s in self._slots if s.loaded)
+
+    @property
+    def total_count(self) -> int:
+        return len(self._slots)
+
+    def load_file(self, path: Path | str) -> FileSlot:
+        """
+        Load a file from disk and assign it to the best matching slot.
+        Matching is case-insensitive on filename stem.
+
+        Returns the slot it was assigned to.
+        Raises ValueError if no matching slot found.
+        """
+        path = Path(path)
+        name_lower = path.name.lower()
+
+        # Try exact match first, then partial
+        for slot in self._slots:
+            if slot.filename.lower() == name_lower:
+                slot.data = path.read_bytes()
+                slot.path = path
+                return slot
+
+        # Partial match fallback (e.g. "V1_0_4_usercode.c" → "usercode.c")
+        for slot in self._slots:
+            stem = slot.filename.lower().rstrip(".ch")
+            if stem in name_lower:
+                slot.data = path.read_bytes()
+                slot.path = path
+                return slot
+
+        raise ValueError(
+            f"File '{path.name}' doesn't match any expected slot: "
+            + ", ".join(s.filename for s in self._slots)
+        )
+
+    def load_directory(self, directory: Path | str) -> list[FileSlot]:
+        """
+        Attempt to load all matching files from a directory.
+        Returns list of slots that were loaded.
+        """
+        directory = Path(directory)
+        loaded = []
+        for f in sorted(directory.iterdir()):
+            if not f.is_file():
+                continue
+            try:
+                slot = self.load_file(f)
+                loaded.append(slot)
+            except ValueError:
+                pass
+        return loaded
+
+    def clear_slot(self, tag: str) -> None:
+        for slot in self._slots:
+            if slot.tag == tag:
+                slot.data = None
+                slot.path = None
+                return
+
+    def clear_all(self) -> None:
+        for slot in self._slots:
+            slot.data = None
+            slot.path = None
+
+    def to_flash_files(self) -> list[FlashFile]:
+        """Return loaded files as FlashFile objects, in programming order."""
+        return [
+            FlashFile(name=slot.filename, data=slot.data)
+            for slot in self._slots
+            if slot.loaded
+        ]
+
+    def validation_errors(self) -> list[str]:
+        """Return list of human-readable validation errors."""
+        errors = []
+        for slot in self._slots:
+            if slot.required and not slot.loaded:
+                errors.append(f"Required file missing: {slot.filename} ({slot.tag})")
+            if slot.loaded and slot.size == 0:
+                errors.append(f"File is empty: {slot.filename}")
+        return errors

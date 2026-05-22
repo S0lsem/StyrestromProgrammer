@@ -1,0 +1,64 @@
+# mrs_protocol/constants.py
+# CAN IDs and protocol constants reverse-engineered from Applix Studio TRC traces
+# MRS PLC Programmer — Styrestrøm AS
+
+# 29-bit extended CAN IDs
+CAN_ID_PC_TO_PLC     = 0x1FFFFFF1   # PC → PLC: handshake, reset, commands
+CAN_ID_PLC_TO_PC     = 0x1FFFFFF2   # PLC → PC: all responses and ACKs
+CAN_ID_PC_DATA       = 0x1FFFFFF3   # PC → PLC: firmware/config data stream
+
+# Handshake payload (bytes 1-5 may encode version/device-ID — keep as-is)
+HANDSHAKE_TX  = bytes([0x20, 0x10, 0x17, 0x01, 0x18, 0xD8])
+HANDSHAKE_RX  = bytes([0x21, 0x10, 0x17, 0x01, 0x18, 0xD8])   # first 6 bytes must match
+
+# Soft reset command
+RESET_CMD     = bytes([0x20, 0x00])
+
+# Boot trigger command (sent after final handshake to start enumeration)
+BOOT_TRIGGER  = bytes([0x02, 0x02])
+
+# Boot enumeration end sequence — PLC sends these three packets in order
+BOOT_END_SEQ  = [
+    bytes([0x00, 0x00, 0x01, 0x00]),
+    bytes([0x00, 0x01, 0x01, 0x00]),
+    bytes([0x00, 0x00, 0x00, 0x01]),  # final boot-done packet
+]
+BOOT_DONE_PACKET = bytes([0x00, 0x00, 0x00, 0x01])
+
+# Data block structure
+DATA_HEADER_MAGIC     = bytes([0x53, 0x31, 0x23])   # constant prefix on all data headers
+DATA_HEADER_ACK       = bytes([0x00, 0x01, 0x01, 0x01, 0x01])  # 5-byte ACK after header
+DATA_CHUNK_ACK        = bytes([0x00, 0x01])                     # 2-byte ACK after each 8-byte chunk
+DATA_FINAL_ACK        = bytes([0x00, 0x00, 0x01])               # 3-byte ACK after 6-byte final chunk
+
+# Block layout:
+#   1× header packet (8 bytes): MAGIC + offset_byte_hi + offset_byte_lo + [data...]
+#   3× data packets (8 bytes each)
+#   1× final packet (6 bytes, last byte = block CRC)
+#
+# Offset increments by 0x20 per block:
+#   block 0 → offset bytes [0x22, 0x00]
+#   block 1 → offset bytes [0x22, 0x20]
+#   block 2 → offset bytes [0x22, 0x40]  etc.
+DATA_BLOCK_SIZE        = 38    # bytes of payload per block (3×8 + 6 - 1 crc byte = 29 payload, but full = 38)
+DATA_CHUNKS_PER_BLOCK  = 3     # number of 8-byte chunks
+DATA_FINAL_SIZE        = 6     # bytes in the final chunk (incl. CRC)
+DATA_OFFSET_INCREMENT  = 0x20  # offset advances by 0x20 per block
+
+# Timeouts (seconds)
+TIMEOUT_HANDSHAKE     = 2.0
+TIMEOUT_RESET_ACK     = 2.0
+TIMEOUT_BOOT_ENUM     = 10.0   # boot enumeration can take ~1 second
+TIMEOUT_BLOCK_ACK     = 2.0
+TIMEOUT_CHUNK_ACK     = 1.0
+
+# Known module types (for UI selection)
+MODULE_TYPES = {
+    "MRS 1.107.110.00":        {"can_fd": False, "bitrate": 250_000},
+    "MRS 1.111.311.00":        {"can_fd": False, "bitrate": 250_000},
+    "MRS 1.158.310.00 CAN FD": {"can_fd": True,  "bitrate": 500_000},
+}
+
+# Default channel
+DEFAULT_CHANNEL  = "PCAN_USBBUS1"
+DEFAULT_BITRATE  = 250_000
