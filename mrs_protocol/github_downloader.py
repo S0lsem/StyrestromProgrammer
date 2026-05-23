@@ -1,19 +1,8 @@
 """
-Downloads firmware files from the private Styrestrøm GitHub repository.
+Downloads firmware files via the Styrestrøm proxy server.
 
-The repo is expected to have one top-level folder per part number, each
-containing the files needed by MRSFileSet (usercode.c, usercode.h, etc.).
-
-Example repo layout:
-    14934X_HB_REALY_V2/
-        usercode.c
-        usercode.h
-        candb.c
-        candb.h
-        Dsl_cfg
-    1494X_32BIT_CANFD_REALY/
-        usercode.c
-        ...
+The proxy server holds the GitHub token — this module never touches it.
+All requests go through PROXY_URL configured in config.py.
 """
 from __future__ import annotations
 
@@ -23,54 +12,41 @@ from typing import Callable, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-_API = 'https://api.github.com'
 
-
-def _headers() -> dict:
-    from .config import GITHUB_TOKEN
-    return {
-        'Authorization': f'Bearer {GITHUB_TOKEN}',
-        'Accept': 'application/vnd.github.v3+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-    }
-
-
-def _get(path: str):
-    from .config import GITHUB_OWNER, GITHUB_REPO
-    url = f'{_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}'
-    req = Request(url, headers=_headers())
+def _proxy_get(endpoint: str):
+    from .config import PROXY_URL, PROXY_API_KEY
+    url = f'{PROXY_URL.rstrip("/")}/{endpoint.lstrip("/")}'
+    headers = {'Accept': 'application/json'}
+    if PROXY_API_KEY:
+        headers['X-Api-Key'] = PROXY_API_KEY
+    req = Request(url, headers=headers)
     try:
-        with urlopen(req, timeout=15) as resp:
+        with urlopen(req, timeout=30) as resp:
             return json.loads(resp.read())
     except HTTPError as exc:
-        if exc.code == 401:
+        if exc.code == 403:
             raise PermissionError(
-                'GitHub token is invalid or expired. '
-                'Update GITHUB_TOKEN in mrs_protocol/config.py.'
+                'Access denied by proxy server. Check PROXY_API_KEY in config.py.'
             ) from exc
         if exc.code == 404:
             raise FileNotFoundError(
-                f'Repository or path not found: {path!r}. '
-                'Check GITHUB_REPO in mrs_protocol/config.py.'
+                f'Not found: {endpoint}'
             ) from exc
-        raise RuntimeError(f'GitHub API error {exc.code}: {exc.reason}') from exc
+        body = ''
+        try:
+            body = exc.read().decode()
+        except Exception:
+            pass
+        raise RuntimeError(f'Server error {exc.code}: {body}') from exc
     except URLError as exc:
-        raise ConnectionError(f'Network error: {exc.reason}') from exc
-
-
-def _firmware_path() -> str:
-    from .config import GITHUB_FIRMWARE_PATH
-    return GITHUB_FIRMWARE_PATH
+        raise ConnectionError(
+            f'Cannot reach server at {url} — check your internet connection.'
+        ) from exc
 
 
 def list_parts() -> list[str]:
-    """Return sorted list of part folder names from the firmware subfolder."""
-    items = _get(_firmware_path())
-    return sorted(
-        item['name']
-        for item in items
-        if item['type'] == 'dir' and not item['name'].startswith('.')
-    )
+    """Return sorted list of part folder names from the proxy."""
+    return _proxy_get('/parts')
 
 
 def download_part(
@@ -79,33 +55,32 @@ def download_part(
     progress: Optional[Callable[[float, str], None]] = None,
 ) -> list[str]:
     """
-    Download all files for *part* from GitHub and load them into *file_set*.
+    Download all files for *part* via the proxy and load them into *file_set*.
 
     Args:
-        part:      Folder name in the repo (e.g. '14934X_HB_REALY_V2').
+        part:      Folder name (e.g. '1493X_HB_RELAY_V2').
         file_set:  An MRSFileSet instance to load files into.
         progress:  Optional callback(fraction, message) for progress reporting.
 
     Returns:
         List of slot tags that were successfully loaded.
     """
-    folder = f'{_firmware_path()}/{part}'
-    items = _get(folder)
-    files = [item for item in items if item['type'] == 'file']
+    if progress:
+        progress(0.0, f'Downloading {part}…')
+
+    files = _proxy_get(f'/parts/{part}/files')
 
     if not files:
-        raise FileNotFoundError(f"No files found in part folder '{part}'.")
+        raise FileNotFoundError(f"No files found for part '{part}'.")
 
     loaded_tags: list[str] = []
 
     for idx, item in enumerate(files):
         name = item['name']
         if progress:
-            progress(idx / len(files), f'Downloading {name}…')
+            progress((idx + 1) / len(files), f'Loading {name}…')
 
-        # The contents API returns base64-encoded file data inline (<1 MB).
-        info = _get(f'{folder}/{name}')
-        data = base64.b64decode(info['content'].replace('\n', ''))
+        data = base64.b64decode(item['content'])
 
         try:
             slot = file_set.load_bytes(name, data)

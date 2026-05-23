@@ -3,22 +3,10 @@
 # config.py is listed in .gitignore and will never be committed.
 # -------------------------------------------------------------------
 
-# GitHub fine-grained Personal Access Token.
-# Create one at: GitHub → Settings → Developer Settings →
-#   Fine-grained tokens → Generate new token
-# Required permissions on the firmware repo:
-#   Contents → Read-only
-GITHUB_TOKEN = 'ghp_PASTE_YOUR_TOKEN_HERE'
+# Proxy server URL (your PythonAnywhere app).
+# Example: 'https://styrestrom.pythonanywhere.com'
+PROXY_URL = 'https://yourusername.pythonanywhere.com'
 
-# GitHub account that owns the firmware repository.
-GITHUB_OWNER = 'S0lsem'
-
-# Name of the private repository that contains the part folders.
-# e.g. if the URL is github.com/S0lsem/MyFirmwareRepo → 'MyFirmwareRepo'
-GITHUB_REPO = 'Code-for-Highbeam-X'
-
-# Branch to download from.
-GITHUB_BRANCH = 'main'
-
-# Subfolder in the repo that contains the part folders.
-GITHUB_FIRMWARE_PATH = 'mrs-firmware'
+# API key — must match the PROXY_API_KEY set on the server.
+# Leave empty if you haven't set one on the server.
+PROXY_API_KEY = ''
