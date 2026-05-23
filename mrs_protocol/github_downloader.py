@@ -58,9 +58,14 @@ def _get(path: str):
         raise ConnectionError(f'Network error: {exc.reason}') from exc
 
 
+def _firmware_path() -> str:
+    from .config import GITHUB_FIRMWARE_PATH
+    return GITHUB_FIRMWARE_PATH
+
+
 def list_parts() -> list[str]:
-    """Return sorted list of part folder names from the firmware repo root."""
-    items = _get('')
+    """Return sorted list of part folder names from the firmware subfolder."""
+    items = _get(_firmware_path())
     return sorted(
         item['name']
         for item in items
@@ -84,7 +89,8 @@ def download_part(
     Returns:
         List of slot tags that were successfully loaded.
     """
-    items = _get(part)
+    folder = f'{_firmware_path()}/{part}'
+    items = _get(folder)
     files = [item for item in items if item['type'] == 'file']
 
     if not files:
@@ -98,7 +104,7 @@ def download_part(
             progress(idx / len(files), f'Downloading {name}…')
 
         # The contents API returns base64-encoded file data inline (<1 MB).
-        info = _get(f'{part}/{name}')
+        info = _get(f'{folder}/{name}')
         data = base64.b64decode(info['content'].replace('\n', ''))
 
         try:

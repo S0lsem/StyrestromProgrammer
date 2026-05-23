@@ -19,3 +19,6 @@ GITHUB_REPO = 'Code-for-Highbeam-X'
 
 # Branch to download from.
 GITHUB_BRANCH = 'main'
+
+# Subfolder in the repo that contains the part folders.
+GITHUB_FIRMWARE_PATH = 'mrs-firmware'
