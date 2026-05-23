@@ -283,18 +283,22 @@ class MainWindow(QMainWindow):
         self._part_combo.clear()
         self._status_label.setText('Fetching part list from GitHub…')
 
-        # Run in a thread so the UI doesn't freeze
-        worker = _ListPartsWorker()
-        thread = QThread(self)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(lambda parts: self._on_parts_loaded(parts, thread))
-        worker.error.connect(lambda msg: self._on_parts_error(msg, thread))
-        thread.finished.connect(thread.deleteLater)
-        thread.start()
+        # Run in a thread so the UI doesn't freeze.
+        # Store as instance vars so they don't get garbage collected.
+        self._parts_worker = _ListPartsWorker()
+        self._parts_thread = QThread(self)
+        self._parts_worker.moveToThread(self._parts_thread)
+        self._parts_thread.started.connect(self._parts_worker.run)
+        self._parts_worker.finished.connect(
+            lambda parts: self._on_parts_loaded(parts)
+        )
+        self._parts_worker.error.connect(
+            lambda msg: self._on_parts_error(msg)
+        )
+        self._parts_thread.start()
 
-    def _on_parts_loaded(self, parts: list[str], thread: QThread) -> None:
-        thread.quit()
+    def _on_parts_loaded(self, parts: list[str]) -> None:
+        self._parts_thread.quit()
         self._refresh_btn.setEnabled(True)
         self._part_combo.clear()
         for p in parts:
@@ -303,8 +307,8 @@ class MainWindow(QMainWindow):
         self._status_label.setText(f'{len(parts)} part(s) found.')
         self._append_log(f'Parts available: {", ".join(parts)}')
 
-    def _on_parts_error(self, msg: str, thread: QThread) -> None:
-        thread.quit()
+    def _on_parts_error(self, msg: str) -> None:
+        self._parts_thread.quit()
         self._refresh_btn.setEnabled(True)
         self._status_label.setText('Error fetching parts — see log')
         self._append_log(f'GitHub error: {msg}')
