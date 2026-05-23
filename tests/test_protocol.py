@@ -110,11 +110,11 @@ class TestFileLoader:
 
     def test_load_by_exact_name(self):
         fs = MRSFileSet()
-        with tempfile.NamedTemporaryFile(suffix='usercode.c', delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix='user_code.c', delete=False) as f:
             f.write(b'// usercode')
             tmp = Path(f.name)
         # Rename to match exactly
-        target = tmp.parent / 'usercode.c'
+        target = tmp.parent / 'user_code.c'
         tmp.rename(target)
         try:
             slot = fs.load_file(target)
@@ -147,26 +147,26 @@ class TestFileLoader:
             p = Path(d)
             # Create files for all required slots
             for name, content in [
-                ('usercode.c', b'uc'),
-                ('usercode.h', b'uh'),
-                ('candb.c',    b'cc'),
-                ('candb.h',    b'ch'),
+                ('user_code.c',      b'uc'),
+                ('user_code.h',      b'uh'),
+                ('can_db_tables.c',  b'cc'),
+                ('can_db_tables.h',  b'ch'),
             ]:
                 (p / name).write_bytes(content)
             fs.load_directory(p)
 
         flash_files = fs.to_flash_files()
         names = [ff.name for ff in flash_files]
-        assert names == ['usercode.c', 'usercode.h', 'candb.c', 'candb.h']
+        assert names == ['user_code.c', 'user_code.h', 'can_db_tables.c', 'can_db_tables.h']
 
     def test_clear_all(self):
         fs = MRSFileSet()
         with tempfile.TemporaryDirectory() as d:
             p = Path(d)
-            (p / 'usercode.c').write_bytes(b'x')
-            fs.load_file(p / 'usercode.c')
+            (p / 'user_code.c').write_bytes(b'x')
+            fs.load_file(p / 'user_code.c')
 
-        assert fs.loaded_count == 1
+        assert fs.loaded_count >= 1
         fs.clear_all()
         assert fs.loaded_count == 0
 

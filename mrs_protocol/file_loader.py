@@ -36,11 +36,11 @@ class MRSFileSet:
     """
 
     SLOTS: list[dict] = [
-        {'tag': 'Usercode C', 'filename': 'usercode.c', 'required': True},
-        {'tag': 'Usercode H', 'filename': 'usercode.h', 'required': True},
-        {'tag': 'CAN DB C',   'filename': 'candb.c',    'required': True},
-        {'tag': 'CAN DB H',   'filename': 'candb.h',    'required': True},
-        {'tag': 'DSL Config', 'filename': 'Dsl_cfg',    'required': False},
+        {'tag': 'Usercode C', 'filename': 'user_code.c',      'required': True},
+        {'tag': 'Usercode H', 'filename': 'user_code.h',      'required': True},
+        {'tag': 'CAN DB C',   'filename': 'can_db_tables.c',  'required': True},
+        {'tag': 'CAN DB H',   'filename': 'can_db_tables.h',  'required': True},
+        {'tag': 'DSL Config', 'filename': 'dsl_cfg.h',        'required': False},
     ]
 
     def __init__(self) -> None:

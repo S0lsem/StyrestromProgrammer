@@ -89,12 +89,19 @@ def list_files(part: str):
     _check_api_key()
     try:
         folder = f'{FIRMWARE_PATH}/{part}'
+        # Firmware files live inside a 'src' subfolder
         items = _github_get(folder)
+        src_folder = folder
+        for item in items:
+            if item['type'] == 'dir' and item['name'].lower() == 'src':
+                src_folder = f'{folder}/{item["name"]}'
+                items = _github_get(src_folder)
+                break
         files = []
         for item in items:
             if item['type'] != 'file':
                 continue
-            info = _github_get(f'{folder}/{item["name"]}')
+            info = _github_get(f'{src_folder}/{item["name"]}')
             files.append({
                 'name': item['name'],
                 'content': info['content'].replace('\n', ''),
