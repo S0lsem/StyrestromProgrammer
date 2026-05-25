@@ -36,6 +36,19 @@ from PyQt6.QtWidgets import (
 from mrs_protocol.constants import MODULE_TYPES
 from mrs_protocol.file_loader import MRSFileSet, FileSlot
 from mrs_protocol.protocol import MRSFlashEngine, FlashFile
+from mrs_protocol.version import APP_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Update check worker
+# ---------------------------------------------------------------------------
+
+class _UpdateCheckWorker(QObject):
+    result = pyqtSignal(dict)
+
+    def run(self) -> None:
+        from mrs_protocol.update_checker import check_for_update
+        self.result.emit(check_for_update())
 
 
 # ---------------------------------------------------------------------------
@@ -177,8 +190,8 @@ class SlotWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle('MRS PLC Programmer — Styrestrøm AS')
-        self.setMinimumSize(720, 680)
+        self.setWindowTitle(f'MRS PLC Programmer v{APP_VERSION} — Styrestrøm AS')
+        self.setMinimumSize(720, 700)
         self.setAcceptDrops(True)
 
         self._file_set       = MRSFileSet()
@@ -190,6 +203,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._setup_logging()
+        self._check_for_updates()
 
     # ------------------------------------------------------------------
     # UI
@@ -200,6 +214,16 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setSpacing(8)
+
+        # ── Update banner (hidden by default) ─────────────────────────
+        self._update_banner = QLabel()
+        self._update_banner.setStyleSheet(
+            'background: #fff3cd; color: #856404; padding: 8px; '
+            'border: 1px solid #ffc107; border-radius: 4px; font-size: 12px;'
+        )
+        self._update_banner.setOpenExternalLinks(True)
+        self._update_banner.setVisible(False)
+        root.addWidget(self._update_banner)
 
         # ── Connection ────────────────────────────────────────────────
         conn_box = QGroupBox('PCAN Adapter')
@@ -298,6 +322,37 @@ class MainWindow(QMainWindow):
         self._log_handler.message_emitted.connect(self._append_log)
         logging.getLogger().addHandler(self._log_handler)
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # ------------------------------------------------------------------
+    # Update check (runs on startup, background thread)
+    # ------------------------------------------------------------------
+
+    def _check_for_updates(self) -> None:
+        self._update_worker = _UpdateCheckWorker()
+        self._update_thread = QThread(self)
+        self._update_worker.moveToThread(self._update_thread)
+        self._update_thread.started.connect(self._update_worker.run)
+        self._update_worker.result.connect(self._on_update_result)
+        self._update_thread.start()
+
+    def _on_update_result(self, info: dict) -> None:
+        self._update_thread.quit()
+        if info.get('error'):
+            return  # silently ignore — don't bother the user
+        if info.get('update_available'):
+            version = info['latest_version']
+            url = info.get('download_url', '')
+            if url:
+                self._update_banner.setText(
+                    f'New version <b>{version}</b> available! '
+                    f'<a href="{url}">Download update</a>'
+                )
+            else:
+                self._update_banner.setText(
+                    f'New version <b>{version}</b> available on GitHub.'
+                )
+            self._update_banner.setVisible(True)
+            self._append_log(f'Update available: {version}')
 
     # ------------------------------------------------------------------
     # Adapter connection check
