@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from mrs_protocol.constants import MODULE_TYPES, DEFAULT_CHANNEL, DEFAULT_BITRATE
+from mrs_protocol.constants import MODULE_TYPES
 from mrs_protocol.file_loader import MRSFileSet, FileSlot
 from mrs_protocol.protocol import MRSFlashEngine, FlashFile
 
@@ -58,19 +58,18 @@ class _QLogHandler(logging.Handler, QObject):
 # ---------------------------------------------------------------------------
 
 class _CheckAdapterWorker(QObject):
-    result = pyqtSignal(bool, str)
+    result = pyqtSignal(bool, str, str)  # ok, channel, message
 
-    def __init__(self, channel: str, bitrate: int, is_can_fd: bool) -> None:
+    def __init__(self, bitrate: int, is_can_fd: bool) -> None:
         super().__init__()
-        self._channel   = channel
         self._bitrate   = bitrate
         self._is_can_fd = is_can_fd
 
     def run(self) -> None:
-        ok, msg = MRSFlashEngine.check_adapter(
-            self._channel, self._bitrate, self._is_can_fd
+        ok, channel, msg = MRSFlashEngine.detect_adapter(
+            self._bitrate, self._is_can_fd
         )
-        self.result.emit(ok, msg)
+        self.result.emit(ok, channel, msg)
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +182,7 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         self._file_set       = MRSFileSet()
+        self._detected_channel: str = ''
         self._dl_worker:     Optional[DownloadWorker] = None
         self._dl_thread:     Optional[QThread]        = None
         self._flash_worker:  Optional[FlashWorker]    = None
@@ -202,7 +202,7 @@ class MainWindow(QMainWindow):
         root.setSpacing(8)
 
         # ── Connection ────────────────────────────────────────────────
-        conn_box = QGroupBox('Connection')
+        conn_box = QGroupBox('PCAN Adapter')
         conn_layout = QHBoxLayout(conn_box)
         conn_layout.addWidget(QLabel('Module:'))
         self._module_combo = QComboBox()
@@ -210,19 +210,14 @@ class MainWindow(QMainWindow):
             self._module_combo.addItem(name)
         conn_layout.addWidget(self._module_combo)
         conn_layout.addSpacing(16)
-        conn_layout.addWidget(QLabel('Channel:'))
-        self._channel_edit = QLineEdit(DEFAULT_CHANNEL)
-        self._channel_edit.setFixedWidth(120)
-        conn_layout.addWidget(self._channel_edit)
-        conn_layout.addSpacing(16)
 
-        self._check_conn_btn = QPushButton('Check adapter')
-        self._check_conn_btn.setFixedWidth(110)
+        self._check_conn_btn = QPushButton('Detect adapter')
+        self._check_conn_btn.setFixedWidth(120)
         self._check_conn_btn.clicked.connect(self._on_check_connection)
         conn_layout.addWidget(self._check_conn_btn)
 
-        self._conn_status = QLabel('  Not checked')
-        self._conn_status.setStyleSheet('color: #888; font-weight: bold;')
+        self._conn_status = QLabel('  Not connected')
+        self._conn_status.setStyleSheet('color: #c22; font-weight: bold;')
         conn_layout.addWidget(self._conn_status)
 
         conn_layout.addStretch()
@@ -310,30 +305,29 @@ class MainWindow(QMainWindow):
 
     def _on_check_connection(self) -> None:
         self._check_conn_btn.setEnabled(False)
-        self._conn_status.setText('  Checking…')
+        self._conn_status.setText('  Scanning…')
         self._conn_status.setStyleSheet('color: #888; font-weight: bold;')
 
         module_name = self._module_combo.currentText()
         cfg = MODULE_TYPES[module_name]
-        channel = self._channel_edit.text().strip() or DEFAULT_CHANNEL
 
-        self._conn_worker = _CheckAdapterWorker(
-            channel, cfg['bitrate'], cfg['can_fd']
-        )
+        self._conn_worker = _CheckAdapterWorker(cfg['bitrate'], cfg['can_fd'])
         self._conn_thread = QThread(self)
         self._conn_worker.moveToThread(self._conn_thread)
         self._conn_thread.started.connect(self._conn_worker.run)
         self._conn_worker.result.connect(self._on_conn_result)
         self._conn_thread.start()
 
-    def _on_conn_result(self, ok: bool, msg: str) -> None:
+    def _on_conn_result(self, ok: bool, channel: str, msg: str) -> None:
         self._conn_thread.quit()
         self._check_conn_btn.setEnabled(True)
         if ok:
-            self._conn_status.setText('  Connected')
+            self._detected_channel = channel
+            self._conn_status.setText(f'  {channel}')
             self._conn_status.setStyleSheet('color: #2a2; font-weight: bold;')
-            self._append_log('PCAN adapter connected.')
+            self._append_log(f'PCAN adapter found on {channel}')
         else:
+            self._detected_channel = ''
             self._conn_status.setText('  Not connected')
             self._conn_status.setStyleSheet('color: #c22; font-weight: bold;')
             self._append_log(f'PCAN adapter not found: {msg}')
@@ -473,9 +467,16 @@ class MainWindow(QMainWindow):
             )
             return
 
+        if not self._detected_channel:
+            QMessageBox.warning(
+                self, 'No adapter',
+                'No PCAN adapter detected.\n\nClick "Detect adapter" first.',
+            )
+            return
+
         module_name = self._module_combo.currentText()
         cfg       = MODULE_TYPES[module_name]
-        channel   = self._channel_edit.text().strip() or DEFAULT_CHANNEL
+        channel   = self._detected_channel
         bitrate   = cfg['bitrate']
         is_can_fd = cfg['can_fd']
         files     = self._file_set.to_flash_files()

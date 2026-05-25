@@ -101,30 +101,34 @@ class MRSFlashEngine:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def check_adapter(
-        channel: str = DEFAULT_CHANNEL,
+    def detect_adapter(
         bitrate: int = DEFAULT_BITRATE,
         is_can_fd: bool = False,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, str]:
         """
-        Check if the PCAN adapter is reachable.
+        Auto-detect which USB port the PCAN adapter is on.
+
+        Tries PCAN_USBBUS1 through PCAN_USBBUS16.
 
         Returns:
-            (True, 'Connected') on success.
-            (False, '<error message>') on failure.
+            (True, channel, 'Connected on <channel>') on success.
+            (False, '', '<error message>') if no adapter found.
         """
-        try:
-            import can
-            bus = can.Bus(
-                interface='pcan',
-                channel=channel,
-                bitrate=bitrate,
-                fd=is_can_fd,
-            )
-            bus.shutdown()
-            return True, 'Connected'
-        except Exception as exc:
-            return False, str(exc)
+        import can
+        for i in range(1, 17):
+            channel = f'PCAN_USBBUS{i}'
+            try:
+                bus = can.Bus(
+                    interface='pcan',
+                    channel=channel,
+                    bitrate=bitrate,
+                    fd=is_can_fd,
+                )
+                bus.shutdown()
+                return True, channel, f'Connected on {channel}'
+            except Exception:
+                continue
+        return False, '', 'No PCAN-USB adapter found. Is it plugged in?'
 
     def open(self) -> None:
         self._open_bus()
