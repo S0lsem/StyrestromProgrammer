@@ -54,6 +54,26 @@ class _QLogHandler(logging.Handler, QObject):
 
 
 # ---------------------------------------------------------------------------
+# Adapter check worker — tests PCAN connection in a QThread
+# ---------------------------------------------------------------------------
+
+class _CheckAdapterWorker(QObject):
+    result = pyqtSignal(bool, str)
+
+    def __init__(self, channel: str, bitrate: int, is_can_fd: bool) -> None:
+        super().__init__()
+        self._channel   = channel
+        self._bitrate   = bitrate
+        self._is_can_fd = is_can_fd
+
+    def run(self) -> None:
+        ok, msg = MRSFlashEngine.check_adapter(
+            self._channel, self._bitrate, self._is_can_fd
+        )
+        self.result.emit(ok, msg)
+
+
+# ---------------------------------------------------------------------------
 # Download worker — fetches firmware files from GitHub in a QThread
 # ---------------------------------------------------------------------------
 
@@ -194,6 +214,17 @@ class MainWindow(QMainWindow):
         self._channel_edit = QLineEdit(DEFAULT_CHANNEL)
         self._channel_edit.setFixedWidth(120)
         conn_layout.addWidget(self._channel_edit)
+        conn_layout.addSpacing(16)
+
+        self._check_conn_btn = QPushButton('Check adapter')
+        self._check_conn_btn.setFixedWidth(110)
+        self._check_conn_btn.clicked.connect(self._on_check_connection)
+        conn_layout.addWidget(self._check_conn_btn)
+
+        self._conn_status = QLabel('  Not checked')
+        self._conn_status.setStyleSheet('color: #888; font-weight: bold;')
+        conn_layout.addWidget(self._conn_status)
+
         conn_layout.addStretch()
         root.addWidget(conn_box)
 
@@ -272,6 +303,40 @@ class MainWindow(QMainWindow):
         self._log_handler.message_emitted.connect(self._append_log)
         logging.getLogger().addHandler(self._log_handler)
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # ------------------------------------------------------------------
+    # Adapter connection check
+    # ------------------------------------------------------------------
+
+    def _on_check_connection(self) -> None:
+        self._check_conn_btn.setEnabled(False)
+        self._conn_status.setText('  Checking…')
+        self._conn_status.setStyleSheet('color: #888; font-weight: bold;')
+
+        module_name = self._module_combo.currentText()
+        cfg = MODULE_TYPES[module_name]
+        channel = self._channel_edit.text().strip() or DEFAULT_CHANNEL
+
+        self._conn_worker = _CheckAdapterWorker(
+            channel, cfg['bitrate'], cfg['can_fd']
+        )
+        self._conn_thread = QThread(self)
+        self._conn_worker.moveToThread(self._conn_thread)
+        self._conn_thread.started.connect(self._conn_worker.run)
+        self._conn_worker.result.connect(self._on_conn_result)
+        self._conn_thread.start()
+
+    def _on_conn_result(self, ok: bool, msg: str) -> None:
+        self._conn_thread.quit()
+        self._check_conn_btn.setEnabled(True)
+        if ok:
+            self._conn_status.setText('  Connected')
+            self._conn_status.setStyleSheet('color: #2a2; font-weight: bold;')
+            self._append_log('PCAN adapter connected.')
+        else:
+            self._conn_status.setText('  Not connected')
+            self._conn_status.setStyleSheet('color: #c22; font-weight: bold;')
+            self._append_log(f'PCAN adapter not found: {msg}')
 
     # ------------------------------------------------------------------
     # GitHub download

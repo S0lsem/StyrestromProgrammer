@@ -100,6 +100,32 @@ class MRSFlashEngine:
     # Public API
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def check_adapter(
+        channel: str = DEFAULT_CHANNEL,
+        bitrate: int = DEFAULT_BITRATE,
+        is_can_fd: bool = False,
+    ) -> tuple[bool, str]:
+        """
+        Check if the PCAN adapter is reachable.
+
+        Returns:
+            (True, 'Connected') on success.
+            (False, '<error message>') on failure.
+        """
+        try:
+            import can
+            bus = can.Bus(
+                interface='pcan',
+                channel=channel,
+                bitrate=bitrate,
+                fd=is_can_fd,
+            )
+            bus.shutdown()
+            return True, 'Connected'
+        except Exception as exc:
+            return False, str(exc)
+
     def open(self) -> None:
         self._open_bus()
 
@@ -243,7 +269,6 @@ class MRSFlashEngine:
             channel=self._channel,
             bitrate=self._bitrate,
             fd=self._is_can_fd,
-            is_extended_id=True,
         )
 
     def _send(self, arb_id: int, data: bytes) -> None:
