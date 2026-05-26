@@ -1,21 +1,37 @@
-def block_checksum(data: bytes) -> int:
+"""
+CRC-8 checksum for MRS PLC flash data blocks.
+
+Algorithm: CRC-8, polynomial 0x09.
+Initial value: first byte of PLC identity (from boot announcement).
+Chaining: each block's init = previous block's CRC result.
+"""
+from .constants import CRC_POLYNOMIAL
+
+
+def block_crc(data: bytes, init: int = 0x00, poly: int = CRC_POLYNOMIAL) -> int:
     """
-    Compute the 1-byte checksum for a data block.
-    Algorithm: XOR of all payload bytes in the block (excluding the checksum
-    byte itself).
+    Compute the CRC-8 for a data block.
 
     Args:
-        data: raw payload bytes of the block (everything before the checksum byte)
+        data: payload bytes (32 bytes for a standard block).
+        init: initial CRC value — first block uses the PLC identity byte,
+              subsequent blocks use the previous block's CRC.
+        poly: CRC polynomial (default 0x09).
 
     Returns:
-        Single checksum byte (0x00–0xFF)
+        Single CRC byte (0x00–0xFF).
     """
-    result = 0
+    crc = init
     for b in data:
-        result ^= b
-    return result & 0xFF
+        crc ^= b
+        for _ in range(8):
+            if crc & 0x80:
+                crc = ((crc << 1) ^ poly) & 0xFF
+            else:
+                crc = (crc << 1) & 0xFF
+    return crc
 
 
-def verify_block(payload: bytes, received_crc: int) -> bool:
-    """Verify a received block against its checksum."""
-    return block_checksum(payload) == received_crc
+def verify_block(payload: bytes, received_crc: int, init: int = 0x00) -> bool:
+    """Verify a received block against its CRC."""
+    return block_crc(payload, init) == received_crc

@@ -116,9 +116,10 @@ class DownloadWorker(QObject):
 # ---------------------------------------------------------------------------
 
 class FlashWorker(QObject):
-    progress = pyqtSignal(float, str)
-    finished = pyqtSignal()
-    error    = pyqtSignal(str)
+    progress   = pyqtSignal(float, str)
+    plc_found  = pyqtSignal(object)   # PLCInfo
+    finished   = pyqtSignal()
+    error      = pyqtSignal(str)
 
     def __init__(
         self,
@@ -143,6 +144,14 @@ class FlashWorker(QObject):
                 is_can_fd=self._is_can_fd,
                 data_bitrate=self._data_bitrate,
             ) as engine:
+                # Wait for PLC to boot
+                self.progress.emit(0.0, 'Waiting for PLC — power on the unit now…')
+                info = engine.wait_for_plc(
+                    timeout=30.0,
+                    progress=self.progress.emit,
+                )
+                self.plc_found.emit(info)
+                # Flash
                 engine.flash(self._files, progress=self.progress.emit)
             self.finished.emit()
         except Exception as exc:
@@ -555,11 +564,13 @@ class MainWindow(QMainWindow):
         data_bitrate = cfg['data_bitrate']
         files        = self._file_set.to_flash_files()
 
+        self._last_plc_info = None
         self._flash_btn.setEnabled(False)
         self._download_btn.setEnabled(False)
         self._progress_bar.setValue(0)
-        self._status_label.setText('Flashing…')
+        self._status_label.setText('Waiting for PLC — power on the unit now…')
         self._append_log(f'Starting flash — module: {module_name}  channel: {channel}')
+        self._append_log('Power on the PLC now (or power-cycle it)…')
 
         self._flash_worker = FlashWorker(files, channel, bitrate, is_can_fd, data_bitrate)
         self._flash_thread = QThread()
@@ -567,6 +578,7 @@ class MainWindow(QMainWindow):
 
         self._flash_thread.started.connect(self._flash_worker.run)
         self._flash_worker.progress.connect(self._on_progress)
+        self._flash_worker.plc_found.connect(self._on_plc_found)
         self._flash_worker.finished.connect(self._on_flash_done)
         self._flash_worker.error.connect(self._on_flash_error)
         self._flash_worker.finished.connect(self._flash_thread.quit)
@@ -579,6 +591,13 @@ class MainWindow(QMainWindow):
         self._progress_bar.setValue(int(fraction * 100))
         self._status_label.setText(message)
 
+    def _on_plc_found(self, info) -> None:
+        self._last_plc_info = info
+        self._append_log(
+            f'PLC detected — SN:{info.serial} Article:{info.article} '
+            f'Rev:{info.revision} App:{info.app_name} {info.app_version}'
+        )
+
     def _on_flash_done(self) -> None:
         self._flash_btn.setEnabled(True)
         self._download_btn.setEnabled(True)
@@ -590,16 +609,21 @@ class MainWindow(QMainWindow):
         module  = self._module_combo.currentText()
         channel = self._detected_channel
         files   = [ff.name for ff in self._file_set.to_flash_files()]
+        info    = self._last_plc_info
+        serial  = str(info.serial) if info else ''
 
         # Write flash log
         from mrs_protocol.flash_log import write_entry
-        log_path = write_entry(part=part, module=module, channel=channel, success=True)
+        log_path = write_entry(
+            part=part, module=module, channel=channel, success=True, serial=serial,
+        )
         self._append_log(f'Flash logged to {log_path}')
 
         # Generate report
         from mrs_protocol.flash_report import generate_report, save_report
         report = generate_report(
-            part=part, module=module, channel=channel, files_flashed=files,
+            part=part, module=module, channel=channel, serial=serial,
+            files_flashed=files,
         )
         report_path = save_report(report)
         self._append_log(f'Report saved to {report_path}')
