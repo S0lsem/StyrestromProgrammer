@@ -18,7 +18,9 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -274,6 +276,18 @@ class MainWindow(QMainWindow):
 
         gh_layout.addStretch()
         root.addWidget(gh_box)
+
+        # ── Batch mode ────────────────────────────────────────────────
+        batch_box = QGroupBox('Batch programming')
+        batch_layout = QHBoxLayout(batch_box)
+        self._batch_check = QCheckBox('Keep firmware loaded between flashes')
+        self._batch_check.setToolTip(
+            'When checked, firmware files stay loaded after flashing.\n'
+            'Useful when programming multiple PLCs with the same firmware.'
+        )
+        batch_layout.addWidget(self._batch_check)
+        batch_layout.addStretch()
+        root.addWidget(batch_box)
 
         # ── Firmware file slots ───────────────────────────────────────
         files_box = QGroupBox('Firmware files  (or drag & drop files here)')
@@ -571,13 +585,63 @@ class MainWindow(QMainWindow):
         self._progress_bar.setValue(100)
         self._status_label.setText('Flash complete!')
         self._append_log('Flash complete.')
-        QMessageBox.information(self, 'Done', 'PLC flashed successfully.')
+
+        part    = self._part_combo.currentText() or '—'
+        module  = self._module_combo.currentText()
+        channel = self._detected_channel
+        files   = [ff.name for ff in self._file_set.to_flash_files()]
+
+        # Write flash log
+        from mrs_protocol.flash_log import write_entry
+        log_path = write_entry(part=part, module=module, channel=channel, success=True)
+        self._append_log(f'Flash logged to {log_path}')
+
+        # Generate report
+        from mrs_protocol.flash_report import generate_report, save_report
+        report = generate_report(
+            part=part, module=module, channel=channel, files_flashed=files,
+        )
+        report_path = save_report(report)
+        self._append_log(f'Report saved to {report_path}')
+
+        # Show result
+        reply = QMessageBox.information(
+            self, 'Flash complete',
+            f'PLC flashed successfully.\n\n'
+            f'Part: {part}\nModule: {module}\n\n'
+            f'Save report to a custom location?',
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Ok,
+            QMessageBox.StandardButton.Ok,
+        )
+        if reply == QMessageBox.StandardButton.Save:
+            path, _ = QFileDialog.getSaveFileName(
+                self, 'Save flash report', f'flash_report_{part}.txt',
+                'Text files (*.txt)',
+            )
+            if path:
+                save_report(report, directory=Path(path).parent)
+                self._append_log(f'Report saved to {path}')
+
+        # Batch mode: keep files loaded, or clear them
+        if not self._batch_check.isChecked():
+            self._file_set.clear_all()
+            self._refresh_slots()
 
     def _on_flash_error(self, tb: str) -> None:
         self._flash_btn.setEnabled(True)
         self._download_btn.setEnabled(True)
         self._status_label.setText('Error — see log')
         self._append_log('ERROR:\n' + tb)
+
+        # Log the failure
+        from mrs_protocol.flash_log import write_entry
+        part   = self._part_combo.currentText() or '—'
+        module = self._module_combo.currentText()
+        write_entry(
+            part=part, module=module, channel=self._detected_channel,
+            success=False, error_msg=tb[:200],
+        )
+
         QMessageBox.critical(self, 'Flash failed', 'An error occurred:\n\n' + tb[:500])
 
     # ------------------------------------------------------------------
