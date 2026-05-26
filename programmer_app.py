@@ -73,14 +73,15 @@ class _QLogHandler(logging.Handler, QObject):
 class _CheckAdapterWorker(QObject):
     result = pyqtSignal(bool, str, str)  # ok, channel, message
 
-    def __init__(self, bitrate: int, is_can_fd: bool) -> None:
+    def __init__(self, bitrate: int, is_can_fd: bool, data_bitrate: int) -> None:
         super().__init__()
-        self._bitrate   = bitrate
-        self._is_can_fd = is_can_fd
+        self._bitrate      = bitrate
+        self._is_can_fd    = is_can_fd
+        self._data_bitrate = data_bitrate
 
     def run(self) -> None:
         ok, channel, msg = MRSFlashEngine.detect_adapter(
-            self._bitrate, self._is_can_fd
+            self._bitrate, self._is_can_fd, self._data_bitrate
         )
         self.result.emit(ok, channel, msg)
 
@@ -119,16 +120,18 @@ class FlashWorker(QObject):
 
     def __init__(
         self,
-        files:     list[FlashFile],
-        channel:   str,
-        bitrate:   int,
-        is_can_fd: bool,
+        files:        list[FlashFile],
+        channel:      str,
+        bitrate:      int,
+        is_can_fd:    bool,
+        data_bitrate: int = 0,
     ) -> None:
         super().__init__()
-        self._files     = files
-        self._channel   = channel
-        self._bitrate   = bitrate
-        self._is_can_fd = is_can_fd
+        self._files        = files
+        self._channel      = channel
+        self._bitrate      = bitrate
+        self._is_can_fd    = is_can_fd
+        self._data_bitrate = data_bitrate
 
     def run(self) -> None:
         try:
@@ -136,6 +139,7 @@ class FlashWorker(QObject):
                 channel=self._channel,
                 bitrate=self._bitrate,
                 is_can_fd=self._is_can_fd,
+                data_bitrate=self._data_bitrate,
             ) as engine:
                 engine.flash(self._files, progress=self.progress.emit)
             self.finished.emit()
@@ -366,7 +370,7 @@ class MainWindow(QMainWindow):
         module_name = self._module_combo.currentText()
         cfg = MODULE_TYPES[module_name]
 
-        self._conn_worker = _CheckAdapterWorker(cfg['bitrate'], cfg['can_fd'])
+        self._conn_worker = _CheckAdapterWorker(cfg['bitrate'], cfg['can_fd'], cfg['data_bitrate'])
         self._conn_thread = QThread(self)
         self._conn_worker.moveToThread(self._conn_thread)
         self._conn_thread.started.connect(self._conn_worker.run)
@@ -529,12 +533,13 @@ class MainWindow(QMainWindow):
             )
             return
 
-        module_name = self._module_combo.currentText()
-        cfg       = MODULE_TYPES[module_name]
-        channel   = self._detected_channel
-        bitrate   = cfg['bitrate']
-        is_can_fd = cfg['can_fd']
-        files     = self._file_set.to_flash_files()
+        module_name  = self._module_combo.currentText()
+        cfg          = MODULE_TYPES[module_name]
+        channel      = self._detected_channel
+        bitrate      = cfg['bitrate']
+        is_can_fd    = cfg['can_fd']
+        data_bitrate = cfg['data_bitrate']
+        files        = self._file_set.to_flash_files()
 
         self._flash_btn.setEnabled(False)
         self._download_btn.setEnabled(False)
@@ -542,7 +547,7 @@ class MainWindow(QMainWindow):
         self._status_label.setText('Flashing…')
         self._append_log(f'Starting flash — module: {module_name}  channel: {channel}')
 
-        self._flash_worker = FlashWorker(files, channel, bitrate, is_can_fd)
+        self._flash_worker = FlashWorker(files, channel, bitrate, is_can_fd, data_bitrate)
         self._flash_thread = QThread()
         self._flash_worker.moveToThread(self._flash_thread)
 

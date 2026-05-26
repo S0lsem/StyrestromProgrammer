@@ -79,11 +79,13 @@ class MRSFlashEngine:
         channel: str = DEFAULT_CHANNEL,
         bitrate: int = DEFAULT_BITRATE,
         is_can_fd: bool = False,
+        data_bitrate: int = 0,
     ) -> None:
-        self._channel   = channel
-        self._bitrate   = bitrate
-        self._is_can_fd = is_can_fd
-        self._bus       = None
+        self._channel      = channel
+        self._bitrate      = bitrate
+        self._is_can_fd    = is_can_fd
+        self._data_bitrate = data_bitrate
+        self._bus           = None
 
     # ------------------------------------------------------------------
     # Context manager
@@ -104,6 +106,7 @@ class MRSFlashEngine:
     def detect_adapter(
         bitrate: int = DEFAULT_BITRATE,
         is_can_fd: bool = False,
+        data_bitrate: int = 0,
     ) -> tuple[bool, str, str]:
         """
         Auto-detect which USB port the PCAN adapter is on.
@@ -118,12 +121,15 @@ class MRSFlashEngine:
         for i in range(1, 17):
             channel = f'PCAN_USBBUS{i}'
             try:
-                bus = can.Bus(
-                    interface='pcan',
-                    channel=channel,
-                    bitrate=bitrate,
-                    fd=is_can_fd,
-                )
+                kwargs = {
+                    'interface': 'pcan',
+                    'channel': channel,
+                    'bitrate': bitrate,
+                    'fd': is_can_fd,
+                }
+                if is_can_fd and data_bitrate:
+                    kwargs['data_bitrate'] = data_bitrate
+                bus = can.Bus(**kwargs)
                 bus.shutdown()
                 return True, channel, f'Connected on {channel}'
             except Exception:
@@ -268,12 +274,15 @@ class MRSFlashEngine:
 
     def _open_bus(self) -> None:
         import can  # imported lazily so unit tests can run without hardware
-        self._bus = can.Bus(
-            interface='pcan',
-            channel=self._channel,
-            bitrate=self._bitrate,
-            fd=self._is_can_fd,
-        )
+        kwargs = {
+            'interface': 'pcan',
+            'channel': self._channel,
+            'bitrate': self._bitrate,
+            'fd': self._is_can_fd,
+        }
+        if self._is_can_fd and self._data_bitrate:
+            kwargs['data_bitrate'] = self._data_bitrate
+        self._bus = can.Bus(**kwargs)
 
     def _send(self, arb_id: int, data: bytes) -> None:
         import can
