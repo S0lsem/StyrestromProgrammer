@@ -1,8 +1,9 @@
 """
 MRS PLC Programmer — PyQt6 desktop application.
 
-Provides a drag-and-drop GUI for loading firmware files and flashing an
-MRS PLC over a PCAN-USB CAN bus adapter.
+Distributor-facing flashing tool. Operator picks a part, the firmware is
+fetched from the Styrestrøm proxy (never exposed as files on disk), and
+the PLC is flashed over a PCAN-USB CAN bus adapter.
 
 Run:  python programmer_app.py
 """
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -190,8 +191,7 @@ class SlotWidget(QWidget):
 
     def refresh(self) -> None:
         if self._slot.loaded:
-            name = self._slot.path.name if self._slot.path else self._slot.filename
-            self._file_label.setText(f'{name}  ({self._slot.size:,} bytes)')
+            self._file_label.setText('Loaded')
             self._file_label.setStyleSheet('color: #2a2; font-weight: bold;')
         else:
             self._file_label.setText('— not loaded —')
@@ -207,7 +207,6 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f'MRS PLC Programmer v{APP_VERSION} — Styrestrøm AS')
         self.setMinimumSize(720, 700)
-        self.setAcceptDrops(True)
 
         self._file_set       = MRSFileSet()
         self._detected_channel: str = ''
@@ -299,7 +298,7 @@ class MainWindow(QMainWindow):
         root.addWidget(batch_box)
 
         # ── Firmware file slots ───────────────────────────────────────
-        files_box = QGroupBox('Firmware files  (or drag & drop files here)')
+        files_box = QGroupBox('Firmware files')
         files_layout = QVBoxLayout(files_box)
         self._slot_widgets: list[SlotWidget] = []
         for slot in self._file_set.slots:
@@ -510,28 +509,6 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, 'Download failed', msg)
 
     # ------------------------------------------------------------------
-    # Drag & drop
-    # ------------------------------------------------------------------
-
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event: QDropEvent) -> None:
-        for url in event.mimeData().urls():
-            path = Path(url.toLocalFile())
-            if path.is_dir():
-                self._file_set.load_directory(path)
-                self._append_log(f'Loaded directory: {path}')
-            elif path.is_file():
-                try:
-                    slot = self._file_set.load_file(path)
-                    self._append_log(f'Loaded: {path.name} → {slot.tag}')
-                except ValueError as exc:
-                    self._append_log(f'Skipped: {path.name} — {exc}')
-        self._refresh_slots()
-
-    # ------------------------------------------------------------------
     # Flash
     # ------------------------------------------------------------------
 
@@ -608,7 +585,6 @@ class MainWindow(QMainWindow):
         part    = self._part_combo.currentText() or '—'
         module  = self._module_combo.currentText()
         channel = self._detected_channel
-        files   = [ff.name for ff in self._file_set.to_flash_files()]
         info    = self._last_plc_info
         serial  = str(info.serial) if info else ''
 
@@ -623,7 +599,6 @@ class MainWindow(QMainWindow):
         from mrs_protocol.flash_report import generate_report, save_report
         report = generate_report(
             part=part, module=module, channel=channel, serial=serial,
-            files_flashed=files,
         )
         report_path = save_report(report)
         self._append_log(f'Report saved to {report_path}')

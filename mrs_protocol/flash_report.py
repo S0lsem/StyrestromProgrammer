@@ -15,9 +15,13 @@ def generate_report(
     channel: str,
     serial: str = '',
     sw_version: str = '',
-    files_flashed: list[str] | None = None,
 ) -> str:
-    """Generate a human-readable flash report as a string."""
+    """Generate a human-readable flash report as a string.
+
+    The report intentionally omits firmware filenames or any per-file
+    detail — that information is a trade secret and must not leak to
+    distributors via the saved report.
+    """
     now = datetime.now()
     lines = [
         '═' * 50,
@@ -37,12 +41,6 @@ def generate_report(
         lines.append(f'  Serial:       {serial}')
     if sw_version:
         lines.append(f'  SW Version:   {sw_version}')
-
-    if files_flashed:
-        lines.append('')
-        lines.append('  Files flashed:')
-        for f in files_flashed:
-            lines.append(f'    - {f}')
 
     lines.extend([
         '',

@@ -1,3 +1,4 @@
 python-can[pcan]
 PyQt6
+cryptography
 pytest

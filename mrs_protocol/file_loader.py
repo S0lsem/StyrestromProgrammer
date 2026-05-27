@@ -157,11 +157,16 @@ class MRSFileSet:
         ]
 
     def validation_errors(self) -> list[str]:
-        """Return list of human-readable validation errors."""
+        """Return list of human-readable validation errors.
+
+        Messages reference the slot tag, never the firmware filename — the
+        filename is a trade secret and must not surface in distributor-visible
+        UI or logs.
+        """
         errors = []
         for slot in self._slots:
             if slot.required and not slot.loaded:
-                errors.append(f'Required file missing: {slot.tag} ({slot.filename})')
+                errors.append(f'Required file missing: {slot.tag}')
             if slot.loaded and slot.size == 0:
-                errors.append(f'File is empty: {slot.filename}')
+                errors.append(f'File is empty: {slot.tag}')
         return errors

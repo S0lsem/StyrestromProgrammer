@@ -25,6 +25,7 @@ from mrs_protocol.constants import (
 )
 from mrs_protocol.file_loader import MRSFileSet
 from mrs_protocol.trc_parser import TrcParser, TrcMessage
+from mrs_protocol import firmware_cache
 
 
 # ---------------------------------------------------------------------------
@@ -237,3 +238,49 @@ class TestTrcParser:
             assert msgs[3].time_ms == pytest.approx(16.2)
         finally:
             tmp.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# TestFirmwareCache — encrypted-at-rest round trip + legacy wipe
+# ---------------------------------------------------------------------------
+
+class TestFirmwareCache:
+    @pytest.fixture
+    def fake_home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(firmware_cache.Path, 'home', lambda: tmp_path)
+        return tmp_path
+
+    def test_round_trip(self, fake_home):
+        files = [
+            {'name': 'app.hex',  'content': 'AAECAwQF'},
+            {'name': 'data.eds', 'content': 'BgcICQoL'},
+        ]
+        firmware_cache.cache_part('PART_X', files)
+        assert firmware_cache.is_cached('PART_X')
+        assert firmware_cache.load_cached_part('PART_X') == files
+
+    def test_manifest_is_not_plaintext(self, fake_home):
+        files = [{'name': 'secret.hex', 'content': 'U0VDUkVU'}]   # 'SECRET' in base64
+        firmware_cache.cache_part('PART_Y', files)
+
+        manifest = fake_home / '.mrs_programmer' / 'cache' / 'PART_Y' / '_manifest.bin'
+        blob = manifest.read_bytes()
+        assert b'secret.hex' not in blob
+        assert b'SECRET'     not in blob
+        assert b'U0VDUkVU'   not in blob
+
+    def test_corrupt_manifest_returns_none(self, fake_home):
+        firmware_cache.cache_part('PART_Z', [{'name': 'a', 'content': 'AA=='}])
+        manifest = fake_home / '.mrs_programmer' / 'cache' / 'PART_Z' / '_manifest.bin'
+        manifest.write_bytes(b'not a valid fernet token')
+        assert firmware_cache.load_cached_part('PART_Z') is None
+
+    def test_legacy_plaintext_wiped(self, fake_home):
+        cache = fake_home / '.mrs_programmer' / 'cache' / 'OLD_PART'
+        cache.mkdir(parents=True)
+        legacy = cache / '_manifest.json'
+        legacy.write_text('[{"name":"leak.hex","content":"AAA="}]')
+
+        # Any cache touch should remove the legacy file.
+        firmware_cache.list_cached_parts()
+        assert not legacy.exists()

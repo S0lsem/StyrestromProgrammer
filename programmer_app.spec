@@ -30,6 +30,9 @@ a = Analysis(
             'mrs_protocol.config',       # gitignored — must exist on build machine
             'can.interfaces.pcan',
             'can.interfaces.pcan.pcan',
+            'cryptography.fernet',
+            'cryptography.hazmat.primitives.ciphers',
+            'cryptography.hazmat.bindings._rust',
         ]
     ),
     hookspath=[],
