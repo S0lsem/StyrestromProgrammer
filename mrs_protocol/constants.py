@@ -60,7 +60,6 @@ BLOCK_PAYLOAD_SIZE    = 32
 DATA_HEADER_DATA_LEN  = 3     # data bytes in header frame
 DATA_CHUNKS_PER_BLOCK = 3
 DATA_FINAL_DATA_LEN   = 5     # data bytes in final frame (before CRC)
-DATA_OFFSET_START     = 0x2200
 DATA_OFFSET_INCREMENT = 0x20
 
 # CRC-8 algorithm: polynomial 0x09, init = first byte of PLC identity,

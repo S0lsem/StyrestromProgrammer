@@ -35,7 +35,6 @@ from .constants import (
     DATA_HEADER_DATA_LEN,
     DATA_CHUNKS_PER_BLOCK,
     DATA_FINAL_DATA_LEN,
-    DATA_OFFSET_START,
     DATA_OFFSET_INCREMENT,
     TIMEOUT_BOOT_ANNOUNCE,
     TIMEOUT_HANDSHAKE,
@@ -48,15 +47,9 @@ from .constants import (
     DEFAULT_BITRATE,
 )
 from .crc import block_crc
+from .s19_parser import Firmware
 
 log = logging.getLogger(__name__)
-
-
-@dataclass
-class FlashFile:
-    """A named binary file to be sent to the PLC."""
-    name: str
-    data: bytes
 
 
 @dataclass
@@ -86,7 +79,7 @@ class MRSFlashEngine:
 
         with MRSFlashEngine(channel='PCAN_USBBUS1', bitrate=500000) as engine:
             info = engine.wait_for_plc()
-            engine.flash(files)
+            engine.flash(firmware)
     """
 
     def __init__(
@@ -213,10 +206,17 @@ class MRSFlashEngine:
 
     def flash(
         self,
-        files: list[FlashFile],
+        firmware: Firmware,
         progress: Optional[Callable[[float, str], None]] = None,
     ) -> None:
-        """Run the complete flash sequence."""
+        """Run the complete flash sequence.
+
+        Args:
+            firmware:  Parsed S-record image. ``firmware.start_address`` is
+                       used as the initial wire offset, so the bytes on the
+                       bus match the PLC's actual flash layout.
+            progress:  Optional callback ``(fraction, message)`` for UI.
+        """
         if self._bus is None:
             self._open_bus()
 
@@ -264,34 +264,36 @@ class MRSFlashEngine:
 
         # Data stream
         _report(0.25, 'Sending firmware data…')
-        total_bytes = sum(len(f.data) for f in files)
-        sent_bytes = 0
+        data = firmware.data
 
-        # CRC init = first byte of PLC identity (e.g. 0x17)
-        crc_state = identity[0]
+        # Pad to multiple of BLOCK_PAYLOAD_SIZE
+        remainder = len(data) % BLOCK_PAYLOAD_SIZE
+        if remainder:
+            data = data + b'\xFF' * (BLOCK_PAYLOAD_SIZE - remainder)
 
-        for flash_file in files:
-            log.info('Sending file: %s (%d bytes)', flash_file.name, len(flash_file.data))
-            data = flash_file.data
+        total_bytes = len(data)
+        sent_bytes  = 0
+        start_addr  = firmware.start_address
+        offset      = start_addr
+        # CRC init = first byte of PLC identity (e.g. 0x17); chained across blocks.
+        crc_state   = identity[0]
 
-            # Pad to multiple of BLOCK_PAYLOAD_SIZE
-            remainder = len(data) % BLOCK_PAYLOAD_SIZE
-            if remainder:
-                data = data + b'\xFF' * (BLOCK_PAYLOAD_SIZE - remainder)
+        log.info('Flashing %d bytes starting at 0x%04X', total_bytes, start_addr)
 
-            offset = DATA_OFFSET_START
+        for block_start in range(0, total_bytes, BLOCK_PAYLOAD_SIZE):
+            payload = data[block_start: block_start + BLOCK_PAYLOAD_SIZE]
+            crc_state = self._send_block(payload, offset, crc_state)
+            offset += DATA_OFFSET_INCREMENT
+            sent_bytes += BLOCK_PAYLOAD_SIZE
+            frac = 0.25 + 0.70 * (sent_bytes / max(total_bytes, 1))
+            _report(min(frac, 0.95), f'Flashing — 0x{offset - DATA_OFFSET_INCREMENT:04X}')
 
-            for block_start in range(0, len(data), BLOCK_PAYLOAD_SIZE):
-                payload = data[block_start: block_start + BLOCK_PAYLOAD_SIZE]
-                crc_state = self._send_block(payload, offset, crc_state)
-                offset += DATA_OFFSET_INCREMENT
-                sent_bytes += BLOCK_PAYLOAD_SIZE
-                frac = 0.25 + 0.70 * (sent_bytes / max(total_bytes, 1))
-                _report(min(frac, 0.95), f'Flashing {flash_file.name} — 0x{offset - DATA_OFFSET_INCREMENT:04X}')
-
-        # End-of-flash command
+        # End-of-flash command. The two address bytes are the firmware
+        # start address; 0xDA is the captured trailing byte from the TRC.
         _report(0.96, 'Finalizing flash…')
-        end_cmd = bytes([*FLASH_END_CMD, 0x22, 0x00, 0xDA])
+        addr_hi = (start_addr >> 8) & 0xFF
+        addr_lo = start_addr & 0xFF
+        end_cmd = bytes([*FLASH_END_CMD, addr_hi, addr_lo, 0xDA])
         self._send(CAN_ID_PC_DATA, end_cmd)
         ack = self._recv(CAN_ID_PLC_TO_PC, timeout=TIMEOUT_BLOCK_ACK)
         log.info('Flash end ACK: %s', ack.hex())

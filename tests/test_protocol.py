@@ -23,9 +23,9 @@ from mrs_protocol.constants import (
     BLOCK_PAYLOAD_SIZE,
     CRC_POLYNOMIAL,
 )
-from mrs_protocol.file_loader import MRSFileSet
 from mrs_protocol.trc_parser import TrcParser, TrcMessage
 from mrs_protocol import firmware_cache
+from mrs_protocol.s19_parser import parse_s19, S19ParseError
 
 
 # ---------------------------------------------------------------------------
@@ -98,86 +98,79 @@ class TestConstants:
 # TestFileLoader
 # ---------------------------------------------------------------------------
 
-class TestFileLoader:
-    def test_slots_defined(self):
-        fs = MRSFileSet()
-        assert len(fs.slots) == 5
+class TestS19Parser:
+    """Verifies the Motorola S-record parser produces the bytes the protocol
+    engine expects. The values used here come from the original PCAN TRC
+    capture (PLC_AtoZ.trc) — same source as TestCRC.test_known_block_1.
+    """
 
-    def test_required_slots(self):
-        fs = MRSFileSet()
-        required = [s for s in fs.slots if s.required]
-        assert len(required) == 4
+    @staticmethod
+    def _checksum(byte_count: int, body_no_checksum: bytes) -> int:
+        return (~(byte_count + sum(body_no_checksum)) & 0xFF)
 
-    def test_not_loaded_initially(self):
-        fs = MRSFileSet()
-        assert fs.loaded_count == 0
-        assert not fs.all_required_loaded
+    @staticmethod
+    def _s1(address: int, data: bytes) -> str:
+        addr_bytes = address.to_bytes(2, 'big')
+        body = addr_bytes + data
+        byte_count = len(body) + 1
+        cs = TestS19Parser._checksum(byte_count, body)
+        return f'S1{byte_count:02X}{body.hex().upper()}{cs:02X}'
 
-    def test_validation_errors_when_empty(self):
-        fs = MRSFileSet()
-        errors = fs.validation_errors()
-        assert len(errors) == 4
-        assert all('Required file missing' in e for e in errors)
+    def test_single_record_round_trip(self):
+        data = bytes(range(16))
+        s19 = self._s1(0x2200, data) + '\nS9030000FC\n'
+        fw = parse_s19(s19)
+        assert fw.start_address == 0x2200
+        assert fw.data == data
 
-    def test_load_by_exact_name(self):
-        fs = MRSFileSet()
-        with tempfile.NamedTemporaryFile(suffix='user_code.c', delete=False) as f:
-            f.write(b'// usercode')
-            tmp = Path(f.name)
-        target = tmp.parent / 'user_code.c'
-        tmp.rename(target)
-        try:
-            slot = fs.load_file(target)
-            assert slot.tag == 'Usercode C'
-            assert slot.loaded
-            assert slot.data == b'// usercode'
-        finally:
-            target.unlink(missing_ok=True)
+    def test_block_1_from_trc(self):
+        """The first 32 bytes parsed at offset 0x2200 must match the
+        block 1 payload captured in PLC_AtoZ.trc (see TestCRC)."""
+        block_1 = bytes([
+            0xA6, 0xE0, 0xC7, 0x18, 0x02, 0x4F, 0xC7, 0x18,
+            0x03, 0xA6, 0x1D, 0xC7, 0x18, 0x09, 0xA6, 0x30,
+            0xC7, 0x18, 0x0A, 0xC6, 0xFF, 0xAF, 0xB7, 0x4A,
+            0xC6, 0xFF, 0xAE, 0xB7, 0x4B, 0x6E, 0x26, 0x49,
+        ])
+        # Split into two 16-byte S1 records, both at expected addresses.
+        s19  = self._s1(0x2200, block_1[:16]) + '\n'
+        s19 += self._s1(0x2210, block_1[16:]) + '\n'
+        fw = parse_s19(s19)
+        assert fw.start_address == 0x2200
+        assert fw.data == block_1
 
-    def test_load_unknown_file_raises(self):
-        fs = MRSFileSet()
-        with tempfile.NamedTemporaryFile(suffix='.xyz', delete=False) as f:
-            f.write(b'garbage')
-            tmp = Path(f.name)
-        target = tmp.parent / 'unknown_file.xyz'
-        tmp.rename(target)
-        try:
-            with pytest.raises(ValueError, match="doesn't match any expected slot"):
-                fs.load_file(target)
-        finally:
-            target.unlink(missing_ok=True)
+    def test_gap_filled_with_ff(self):
+        # Two records with a 4-byte gap should be joined with 0xFF padding.
+        s19  = self._s1(0x1000, b'\xAA\xBB') + '\n'
+        s19 += self._s1(0x1006, b'\xCC\xDD') + '\n'
+        fw = parse_s19(s19)
+        assert fw.start_address == 0x1000
+        assert fw.data == b'\xAA\xBB\xFF\xFF\xFF\xFF\xCC\xDD'
 
-    def test_to_flash_files_empty_when_no_files(self):
-        fs = MRSFileSet()
-        assert fs.to_flash_files() == []
+    def test_ignores_s0_s5_s9_records(self):
+        s19 = (
+            'S00F000068656C6C6F2020202000000038\n'   # S0 header
+            + self._s1(0x2000, b'\x01\x02\x03') + '\n'
+            + 'S5030001FB\n'                          # S5 count
+            + 'S9030000FC\n'                          # S9 termination
+        )
+        fw = parse_s19(s19)
+        assert fw.data == b'\x01\x02\x03'
 
-    def test_to_flash_files_order(self):
-        fs = MRSFileSet()
-        with tempfile.TemporaryDirectory() as d:
-            p = Path(d)
-            for name, content in [
-                ('user_code.c',      b'uc'),
-                ('user_code.h',      b'uh'),
-                ('can_db_tables.c',  b'cc'),
-                ('can_db_tables.h',  b'ch'),
-            ]:
-                (p / name).write_bytes(content)
-            fs.load_directory(p)
+    def test_bad_checksum_raises(self):
+        # Build a valid record, then corrupt the checksum byte.
+        good = self._s1(0x2000, b'\x42')
+        bad  = good[:-2] + 'FF'
+        with pytest.raises(S19ParseError, match='checksum'):
+            parse_s19(bad + '\n')
 
-        flash_files = fs.to_flash_files()
-        names = [ff.name for ff in flash_files]
-        assert names == ['user_code.c', 'user_code.h', 'can_db_tables.c', 'can_db_tables.h']
+    def test_empty_input_raises(self):
+        with pytest.raises(S19ParseError, match='No data records'):
+            parse_s19('S9030000FC\n')   # only a termination record
 
-    def test_clear_all(self):
-        fs = MRSFileSet()
-        with tempfile.TemporaryDirectory() as d:
-            p = Path(d)
-            (p / 'user_code.c').write_bytes(b'x')
-            fs.load_file(p / 'user_code.c')
-
-        assert fs.loaded_count >= 1
-        fs.clear_all()
-        assert fs.loaded_count == 0
+    def test_malformed_line_raises(self):
+        with pytest.raises(S19ParseError):
+            parse_s19('this is not an s-record\n')
 
 
 # ---------------------------------------------------------------------------
@@ -250,27 +243,30 @@ class TestFirmwareCache:
         monkeypatch.setattr(firmware_cache.Path, 'home', lambda: tmp_path)
         return tmp_path
 
+    _SAMPLE_S19 = (
+        'S00F000068656C6C6F2020202000000038\n'
+        'S10A2200A6E0C7180204FC1F\n'
+        'S9030000FC\n'
+    )
+
     def test_round_trip(self, fake_home):
-        files = [
-            {'name': 'app.hex',  'content': 'AAECAwQF'},
-            {'name': 'data.eds', 'content': 'BgcICQoL'},
-        ]
-        firmware_cache.cache_part('PART_X', files)
+        firmware_cache.cache_part('PART_X', self._SAMPLE_S19)
         assert firmware_cache.is_cached('PART_X')
-        assert firmware_cache.load_cached_part('PART_X') == files
+        assert firmware_cache.load_cached_part('PART_X') == self._SAMPLE_S19
 
     def test_manifest_is_not_plaintext(self, fake_home):
-        files = [{'name': 'secret.hex', 'content': 'U0VDUkVU'}]   # 'SECRET' in base64
-        firmware_cache.cache_part('PART_Y', files)
+        secret = 'S10A22005345435245543F1E\n'   # contains 'SECRET' in hex
+        firmware_cache.cache_part('PART_Y', secret)
 
         manifest = fake_home / '.mrs_programmer' / 'cache' / 'PART_Y' / '_manifest.bin'
         blob = manifest.read_bytes()
-        assert b'secret.hex' not in blob
-        assert b'SECRET'     not in blob
-        assert b'U0VDUkVU'   not in blob
+        # Neither the SREC framing nor the embedded payload should appear in clear.
+        assert b'S1'      not in blob
+        assert b'SECRET'  not in blob
+        assert bytes.fromhex('5345435245') not in blob
 
     def test_corrupt_manifest_returns_none(self, fake_home):
-        firmware_cache.cache_part('PART_Z', [{'name': 'a', 'content': 'AA=='}])
+        firmware_cache.cache_part('PART_Z', self._SAMPLE_S19)
         manifest = fake_home / '.mrs_programmer' / 'cache' / 'PART_Z' / '_manifest.bin'
         manifest.write_bytes(b'not a valid fernet token')
         assert firmware_cache.load_cached_part('PART_Z') is None

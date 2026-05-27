@@ -1,6 +1,6 @@
 """
-Local firmware cache — stores downloaded firmware files on disk
-so they can be used without an internet connection.
+Local firmware cache — stores downloaded .s19 firmware text on disk
+so it can be flashed without an internet connection.
 
 The cache is encrypted (Fernet / AES-128-CBC + HMAC-SHA256) with a key
 derived from two byte arrays XORed at runtime. The cache file is opaque
@@ -11,7 +11,6 @@ Cache location: ~/.mrs_programmer/cache/<part_name>/_manifest.bin
 from __future__ import annotations
 
 import base64
-import json
 from pathlib import Path
 from typing import Optional
 
@@ -48,12 +47,7 @@ def _cache_root() -> Path:
 
 
 def _wipe_legacy_plaintext(root: Path) -> None:
-    """Delete any plaintext _manifest.json files left over from older builds.
-
-    Older versions cached firmware as plaintext base64 JSON. Removing those
-    files on every cache touch ensures an upgrade closes the leak without
-    requiring the user to do anything.
-    """
+    """Delete any plaintext _manifest.json files left over from older builds."""
     try:
         for legacy in root.glob(f'*/{_LEGACY_MANIFEST_NAME}'):
             try:
@@ -64,38 +58,32 @@ def _wipe_legacy_plaintext(root: Path) -> None:
         pass
 
 
-def cache_part(part: str, files: list[dict]) -> None:
-    """
-    Save downloaded firmware files to the local cache (encrypted).
+def cache_part(part: str, s19_text: str) -> None:
+    """Save the downloaded .s19 firmware text to the local cache (encrypted).
 
     Args:
-        part:  Part folder name (e.g. '1493X_HB_RELAY_V2').
-        files: List of dicts with 'name' and 'content' (base64) keys,
-               as returned by the proxy server.
+        part:      Part folder name (e.g. '1493X_HB_RELAY_V2').
+        s19_text:  Raw Motorola S-record text as fetched from the proxy.
     """
     part_dir = _cache_root() / part
     part_dir.mkdir(parents=True, exist_ok=True)
 
-    blob = json.dumps(files).encode('utf-8')
-    token = Fernet(_key()).encrypt(blob)
+    token = Fernet(_key()).encrypt(s19_text.encode('ascii'))
     (part_dir / _MANIFEST_NAME).write_bytes(token)
 
 
-def load_cached_part(part: str) -> Optional[list[dict]]:
-    """
-    Load firmware files from the local cache.
+def load_cached_part(part: str) -> Optional[str]:
+    """Load .s19 firmware text from the local cache.
 
-    Returns:
-        List of dicts with 'name' and 'content' keys, or None if not cached
-        or the cache file is corrupt / from an incompatible build.
+    Returns the raw S-record text, or None if not cached or corrupt.
     """
     manifest = _cache_root() / part / _MANIFEST_NAME
     if not manifest.exists():
         return None
     try:
         plaintext = Fernet(_key()).decrypt(manifest.read_bytes())
-        return json.loads(plaintext)
-    except (InvalidToken, json.JSONDecodeError, OSError, ValueError):
+        return plaintext.decode('ascii')
+    except (InvalidToken, UnicodeDecodeError, OSError, ValueError):
         return None
 
 

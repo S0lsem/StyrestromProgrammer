@@ -37,8 +37,8 @@ from PyQt6.QtWidgets import (
 )
 
 from mrs_protocol.constants import MODULE_TYPES
-from mrs_protocol.file_loader import MRSFileSet, FileSlot
-from mrs_protocol.protocol import MRSFlashEngine, FlashFile
+from mrs_protocol.protocol import MRSFlashEngine
+from mrs_protocol.s19_parser import Firmware
 from mrs_protocol.version import APP_VERSION
 
 
@@ -90,24 +90,23 @@ class _CheckAdapterWorker(QObject):
 
 
 # ---------------------------------------------------------------------------
-# Download worker — fetches firmware files from GitHub in a QThread
+# Download worker — fetches and parses the firmware.s19 in a QThread
 # ---------------------------------------------------------------------------
 
 class DownloadWorker(QObject):
     progress = pyqtSignal(float, str)
-    finished = pyqtSignal(list)   # list[str] of loaded slot tags
+    finished = pyqtSignal(object)   # Firmware
     error    = pyqtSignal(str)
 
-    def __init__(self, part: str, file_set: MRSFileSet) -> None:
+    def __init__(self, part: str) -> None:
         super().__init__()
-        self._part     = part
-        self._file_set = file_set
+        self._part = part
 
     def run(self) -> None:
         try:
             from mrs_protocol.github_downloader import download_part
-            loaded = download_part(self._part, self._file_set, self.progress.emit)
-            self.finished.emit(loaded)
+            firmware = download_part(self._part, self.progress.emit)
+            self.finished.emit(firmware)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -124,14 +123,14 @@ class FlashWorker(QObject):
 
     def __init__(
         self,
-        files:        list[FlashFile],
+        firmware:     Firmware,
         channel:      str,
         bitrate:      int,
         is_can_fd:    bool,
         data_bitrate: int = 0,
     ) -> None:
         super().__init__()
-        self._files        = files
+        self._firmware     = firmware
         self._channel      = channel
         self._bitrate      = bitrate
         self._is_can_fd    = is_can_fd
@@ -153,49 +152,12 @@ class FlashWorker(QObject):
                 )
                 self.plc_found.emit(info)
                 # Flash
-                engine.flash(self._files, progress=self.progress.emit)
+                engine.flash(self._firmware, progress=self.progress.emit)
             self.finished.emit()
         except Exception as exc:
             self.error.emit(
                 ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
             )
-
-
-# ---------------------------------------------------------------------------
-# File slot widget
-# ---------------------------------------------------------------------------
-
-class SlotWidget(QWidget):
-    def __init__(self, slot: FileSlot) -> None:
-        super().__init__()
-        self._slot = slot
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 2, 4, 2)
-
-        tag_label = QLabel(slot.tag)
-        tag_label.setFixedWidth(100)
-        layout.addWidget(tag_label)
-
-        self._file_label = QLabel('— not loaded —')
-        self._file_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
-        )
-        layout.addWidget(self._file_label)
-
-        req_label = QLabel('(required)' if slot.required else '(optional)')
-        req_label.setStyleSheet('color: grey; font-size: 10px;')
-        layout.addWidget(req_label)
-
-        self.refresh()
-
-    def refresh(self) -> None:
-        if self._slot.loaded:
-            self._file_label.setText('Loaded')
-            self._file_label.setStyleSheet('color: #2a2; font-weight: bold;')
-        else:
-            self._file_label.setText('— not loaded —')
-            self._file_label.setStyleSheet('color: #888;')
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +170,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f'MRS PLC Programmer v{APP_VERSION} — Styrestrøm AS')
         self.setMinimumSize(720, 700)
 
-        self._file_set       = MRSFileSet()
-        self._detected_channel: str = ''
+        self._firmware: Optional[Firmware] = None
+        self._loaded_part_name: str        = ''
+        self._detected_channel: str        = ''
         self._dl_worker:     Optional[DownloadWorker] = None
         self._dl_thread:     Optional[QThread]        = None
         self._flash_worker:  Optional[FlashWorker]    = None
@@ -297,18 +260,21 @@ class MainWindow(QMainWindow):
         batch_layout.addStretch()
         root.addWidget(batch_box)
 
-        # ── Firmware file slots ───────────────────────────────────────
-        files_box = QGroupBox('Firmware files')
-        files_layout = QVBoxLayout(files_box)
-        self._slot_widgets: list[SlotWidget] = []
-        for slot in self._file_set.slots:
-            sw = SlotWidget(slot)
-            files_layout.addWidget(sw)
-            self._slot_widgets.append(sw)
-        clear_btn = QPushButton('Clear all files')
-        clear_btn.clicked.connect(self._on_clear_all)
-        files_layout.addWidget(clear_btn)
-        root.addWidget(files_box)
+        # ── Firmware status ───────────────────────────────────────────
+        fw_box = QGroupBox('Firmware')
+        fw_layout = QHBoxLayout(fw_box)
+        self._firmware_label = QLabel('— not loaded —')
+        self._firmware_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        self._firmware_label.setStyleSheet('color: #888;')
+        fw_layout.addWidget(self._firmware_label)
+        self._clear_fw_btn = QPushButton('Clear')
+        self._clear_fw_btn.setFixedWidth(80)
+        self._clear_fw_btn.setEnabled(False)
+        self._clear_fw_btn.clicked.connect(self._on_clear_firmware)
+        fw_layout.addWidget(self._clear_fw_btn)
+        root.addWidget(fw_box)
 
         # ── Progress ──────────────────────────────────────────────────
         prog_box = QGroupBox('Progress')
@@ -459,8 +425,9 @@ class MainWindow(QMainWindow):
         if not part:
             return
 
-        self._file_set.clear_all()
-        self._refresh_slots()
+        self._firmware = None
+        self._loaded_part_name = ''
+        self._refresh_firmware_label()
         self._download_btn.setEnabled(False)
         self._refresh_btn.setEnabled(False)
         self._flash_btn.setEnabled(False)
@@ -468,7 +435,7 @@ class MainWindow(QMainWindow):
         self._status_label.setText(f'Downloading {part}…')
         self._append_log(f'Downloading part: {part}')
 
-        self._dl_worker = DownloadWorker(part, self._file_set)
+        self._dl_worker = DownloadWorker(part)
         self._dl_thread = QThread()
         self._dl_worker.moveToThread(self._dl_thread)
 
@@ -486,21 +453,22 @@ class MainWindow(QMainWindow):
         self._progress_bar.setValue(int(fraction * 100))
         self._status_label.setText(message)
 
-    def _on_dl_done(self, loaded_tags: list[str]) -> None:
-        self._refresh_slots()
+    def _on_dl_done(self, firmware: Firmware) -> None:
+        self._firmware = firmware
+        self._loaded_part_name = self._part_combo.currentText()
+        self._refresh_firmware_label()
         self._download_btn.setEnabled(True)
         self._refresh_btn.setEnabled(True)
         self._flash_btn.setEnabled(True)
         self._progress_bar.setValue(100)
-        self._status_label.setText(f'Downloaded: {", ".join(loaded_tags)}')
-        self._append_log(f'Files loaded: {", ".join(loaded_tags)}')
-
-        errors = self._file_set.validation_errors()
-        if errors:
-            self._append_log('WARNING — ' + '; '.join(errors))
+        self._status_label.setText(f'Firmware ready: {self._loaded_part_name}')
+        self._append_log(
+            f'Firmware loaded: {self._loaded_part_name} '
+            f'({len(firmware):,} bytes from 0x{firmware.start_address:04X})'
+        )
 
     def _on_dl_error(self, msg: str) -> None:
-        self._refresh_slots()
+        self._refresh_firmware_label()
         self._download_btn.setEnabled(True)
         self._refresh_btn.setEnabled(True)
         self._flash_btn.setEnabled(True)
@@ -512,17 +480,17 @@ class MainWindow(QMainWindow):
     # Flash
     # ------------------------------------------------------------------
 
-    def _on_clear_all(self) -> None:
-        self._file_set.clear_all()
-        self._refresh_slots()
-        self._append_log('All files cleared.')
+    def _on_clear_firmware(self) -> None:
+        self._firmware = None
+        self._loaded_part_name = ''
+        self._refresh_firmware_label()
+        self._append_log('Firmware cleared.')
 
     def _on_flash(self) -> None:
-        errors = self._file_set.validation_errors()
-        if errors:
+        if self._firmware is None:
             QMessageBox.warning(
-                self, 'Files missing',
-                'Cannot flash — missing required files:\n\n' + '\n'.join(errors),
+                self, 'No firmware',
+                'Pick a part and click Download before flashing.',
             )
             return
 
@@ -539,7 +507,7 @@ class MainWindow(QMainWindow):
         bitrate      = cfg['bitrate']
         is_can_fd    = cfg['can_fd']
         data_bitrate = cfg['data_bitrate']
-        files        = self._file_set.to_flash_files()
+        firmware     = self._firmware
 
         self._last_plc_info = None
         self._flash_btn.setEnabled(False)
@@ -549,7 +517,7 @@ class MainWindow(QMainWindow):
         self._append_log(f'Starting flash — module: {module_name}  channel: {channel}')
         self._append_log('Power on the PLC now (or power-cycle it)…')
 
-        self._flash_worker = FlashWorker(files, channel, bitrate, is_can_fd, data_bitrate)
+        self._flash_worker = FlashWorker(firmware, channel, bitrate, is_can_fd, data_bitrate)
         self._flash_thread = QThread()
         self._flash_worker.moveToThread(self._flash_thread)
 
@@ -621,10 +589,11 @@ class MainWindow(QMainWindow):
                 save_report(report, directory=Path(path).parent)
                 self._append_log(f'Report saved to {path}')
 
-        # Batch mode: keep files loaded, or clear them
+        # Batch mode: keep firmware loaded, or clear it
         if not self._batch_check.isChecked():
-            self._file_set.clear_all()
-            self._refresh_slots()
+            self._firmware = None
+            self._loaded_part_name = ''
+            self._refresh_firmware_label()
 
     def _on_flash_error(self, tb: str) -> None:
         self._flash_btn.setEnabled(True)
@@ -647,9 +616,18 @@ class MainWindow(QMainWindow):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _refresh_slots(self) -> None:
-        for sw in self._slot_widgets:
-            sw.refresh()
+    def _refresh_firmware_label(self) -> None:
+        if self._firmware is not None:
+            self._firmware_label.setText(
+                f'Loaded: {self._loaded_part_name}  '
+                f'({len(self._firmware):,} bytes)'
+            )
+            self._firmware_label.setStyleSheet('color: #2a2; font-weight: bold;')
+            self._clear_fw_btn.setEnabled(True)
+        else:
+            self._firmware_label.setText('— not loaded —')
+            self._firmware_label.setStyleSheet('color: #888;')
+            self._clear_fw_btn.setEnabled(False)
 
     def _append_log(self, text: str) -> None:
         self._log_edit.append(text)
