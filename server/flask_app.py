@@ -30,6 +30,8 @@ Expected repo layout (private GitHub repo, owner/name set below):
                               may sit at the part-folder root or under src/.
                               First .s19 found (root first, then src/) wins.
 """
+from __future__ import annotations
+
 import base64
 import json
 import os
