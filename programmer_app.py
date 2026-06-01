@@ -40,7 +40,7 @@ from types import SimpleNamespace
 
 from mrs_protocol.constants import MODULE_TYPES
 from mrs_protocol.console_flasher import run_flash
-from mrs_protocol.protocol import detect_adapter
+from mrs_protocol.protocol import detect_adapter, scan_plc, ScanError
 from mrs_protocol.s19_parser import Firmware
 from mrs_protocol.version import APP_VERSION
 
@@ -115,6 +115,41 @@ class DownloadWorker(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Scan worker — listens for a PLC boot announcement and reads identity
+# ---------------------------------------------------------------------------
+
+class ScanWorker(QObject):
+    result = pyqtSignal(object)   # PLCInfo
+    error  = pyqtSignal(str)
+
+    def __init__(
+        self,
+        channel:      str,
+        bitrate:      int,
+        is_can_fd:    bool,
+        data_bitrate: int,
+    ) -> None:
+        super().__init__()
+        self._channel      = channel
+        self._bitrate      = bitrate
+        self._is_can_fd    = is_can_fd
+        self._data_bitrate = data_bitrate
+
+    def run(self) -> None:
+        try:
+            info = scan_plc(
+                self._channel, self._bitrate, self._is_can_fd, self._data_bitrate
+            )
+            self.result.emit(info)
+        except ScanError as exc:
+            self.error.emit(str(exc))
+        except Exception as exc:
+            self.error.emit(
+                ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            )
+
+
+# ---------------------------------------------------------------------------
 # Flash worker — runs the CAN flash sequence in a QThread
 # ---------------------------------------------------------------------------
 
@@ -173,6 +208,8 @@ class MainWindow(QMainWindow):
         self._dl_thread:     Optional[QThread]        = None
         self._flash_worker:  Optional[FlashWorker]    = None
         self._flash_thread:  Optional[QThread]        = None
+        self._scan_worker:   Optional[ScanWorker]     = None
+        self._scan_thread:   Optional[QThread]        = None
 
         self._build_ui()
         self._setup_logging()
@@ -212,6 +249,16 @@ class MainWindow(QMainWindow):
         self._check_conn_btn.setFixedWidth(120)
         self._check_conn_btn.clicked.connect(self._on_check_connection)
         conn_layout.addWidget(self._check_conn_btn)
+
+        self._scan_btn = QPushButton('Scan PLC')
+        self._scan_btn.setFixedWidth(100)
+        self._scan_btn.setToolTip(
+            'Listen for a PLC boot announcement, then read its identity '
+            '(SN, article, app name + version). Power-cycle the PLC after '
+            'clicking. Read-only — does not erase or flash.'
+        )
+        self._scan_btn.clicked.connect(self._on_scan)
+        conn_layout.addWidget(self._scan_btn)
 
         self._conn_status = QLabel('  Not connected')
         self._conn_status.setStyleSheet('color: #c22; font-weight: bold;')
@@ -290,6 +337,15 @@ class MainWindow(QMainWindow):
         self._log_edit.setReadOnly(True)
         self._log_edit.setFont(QFont('Courier New', 9))
         log_layout.addWidget(self._log_edit)
+
+        log_btn_row = QHBoxLayout()
+        log_btn_row.addStretch()
+        self._clear_log_btn = QPushButton('Clear log')
+        self._clear_log_btn.setFixedWidth(100)
+        self._clear_log_btn.clicked.connect(self._log_edit.clear)
+        log_btn_row.addWidget(self._clear_log_btn)
+        log_layout.addLayout(log_btn_row)
+
         root.addWidget(log_box)
 
         # ── Flash button ──────────────────────────────────────────────
@@ -600,6 +656,71 @@ class MainWindow(QMainWindow):
         )
 
         QMessageBox.critical(self, 'Flash failed', 'An error occurred:\n\n' + tb[:500])
+
+    # ------------------------------------------------------------------
+    # Scan handlers
+    # ------------------------------------------------------------------
+
+    def _on_scan(self) -> None:
+        if not self._detected_channel:
+            QMessageBox.warning(
+                self, 'No adapter',
+                'No PCAN adapter detected.\n\nClick "Detect adapter" first.',
+            )
+            return
+
+        module_name = self._module_combo.currentText()
+        cfg         = MODULE_TYPES[module_name]
+
+        self._scan_btn.setEnabled(False)
+        self._check_conn_btn.setEnabled(False)
+        self._flash_btn.setEnabled(False)
+        self._status_label.setText('Scanning — power-cycle the PLC now…')
+        self._append_log(
+            f'Scan started — module: {module_name}  channel: {self._detected_channel}'
+        )
+        self._append_log('Power-cycle the PLC now…')
+
+        self._scan_worker = ScanWorker(
+            self._detected_channel,
+            cfg['bitrate'],
+            cfg['can_fd'],
+            cfg['data_bitrate'],
+        )
+        self._scan_thread = QThread()
+        self._scan_worker.moveToThread(self._scan_thread)
+
+        self._scan_thread.started.connect(self._scan_worker.run)
+        self._scan_worker.result.connect(self._on_scan_done)
+        self._scan_worker.error.connect(self._on_scan_error)
+        self._scan_worker.result.connect(self._scan_thread.quit)
+        self._scan_worker.error.connect(self._scan_thread.quit)
+        self._scan_thread.finished.connect(self._scan_thread.deleteLater)
+
+        self._scan_thread.start()
+
+    def _on_scan_done(self, info) -> None:
+        self._scan_btn.setEnabled(True)
+        self._check_conn_btn.setEnabled(True)
+        self._flash_btn.setEnabled(True)
+        self._status_label.setText(f'PLC found — SN {info.serial}')
+
+        self._append_log(f'PLC FOUND — SN: {info.serial}')
+        self._append_log(f'  Article:     {info.article}')
+        self._append_log(f'  Revision:    {info.revision}')
+        self._append_log(f'  App name:    {info.app_name}')
+        self._append_log(f'  App version: {info.app_version}')
+        if info.description:
+            self._append_log(f'  Description: {info.description}')
+        self._append_log('Power-cycle the PLC again before clicking Flash.')
+
+    def _on_scan_error(self, msg: str) -> None:
+        self._scan_btn.setEnabled(True)
+        self._check_conn_btn.setEnabled(True)
+        self._flash_btn.setEnabled(True)
+        self._status_label.setText('Scan failed')
+        self._append_log(f'Scan failed: {msg}')
+        QMessageBox.warning(self, 'Scan failed', msg)
 
     # ------------------------------------------------------------------
     # Helpers
