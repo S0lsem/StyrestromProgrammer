@@ -710,6 +710,7 @@ class MainWindow(QMainWindow):
         from mrs_protocol.flash_log import write_entry
         log_path = write_entry(
             part=part, module=module, channel=channel, success=True, serial=serial,
+            distributor=self._distributor(), operator=self._operator(),
         )
         self._append_log(f'Flash logged to {log_path}')
 
@@ -770,6 +771,7 @@ class MainWindow(QMainWindow):
         write_entry(
             part=part, module=module, channel=self._detected_channel,
             success=False, error_msg=tb[:200],
+            distributor=self._distributor(), operator=self._operator(),
         )
 
         # Report failure event to the proxy
