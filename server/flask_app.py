@@ -45,23 +45,21 @@ app = Flask(__name__)
 # ---------- Configuration ----------
 GITHUB_TOKEN  = os.environ.get('GITHUB_TOKEN', '')
 PROXY_API_KEY = os.environ.get('PROXY_API_KEY', '')
-GITHUB_OWNER  = 'S0lsem'
-GITHUB_REPO   = 'Code-for-Highbeam-X'
+GITHUB_OWNER = 'S0lsem'
+GITHUB_REPO = 'Code-for-Highbeam-X'
 FIRMWARE_PATH = 'mrs-firmware'
 
 _API = 'https://api.github.com'
 
 
-# ---------- Auth check ----------
 def _check_api_key():
     key = request.headers.get('X-Api-Key', '')
     if not PROXY_API_KEY:
-        return  # no key configured — skip check (dev mode)
+        return
     if key != PROXY_API_KEY:
         abort(403, 'Invalid API key')
 
 
-# ---------- GitHub helper ----------
 def _github_get(path: str):
     url = f'{_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}'
     req = Request(url, headers={
@@ -71,25 +69,6 @@ def _github_get(path: str):
     })
     with urlopen(req, timeout=15) as resp:
         return json.loads(resp.read())
-
-
-# ---------- Endpoints ----------
-@app.route('/parts', methods=['GET'])
-def list_parts():
-    """Return list of part folder names."""
-    _check_api_key()
-    try:
-        items = _github_get(FIRMWARE_PATH)
-        parts = sorted(
-            item['name']
-            for item in items
-            if item['type'] == 'dir' and not item['name'].startswith('.')
-        )
-        return jsonify(parts)
-    except HTTPError as exc:
-        return jsonify({'error': f'GitHub API error: {exc.code}'}), 502
-    except URLError as exc:
-        return jsonify({'error': f'Network error: {exc.reason}'}), 502
 
 
 def _find_s19(part: str) -> tuple[str, str] | None:
@@ -110,6 +89,23 @@ def _find_s19(part: str) -> tuple[str, str] | None:
             if item.get('type') == 'file' and item['name'].lower().endswith('.s19'):
                 return folder, item['name']
     return None
+
+
+@app.route('/parts', methods=['GET'])
+def list_parts():
+    _check_api_key()
+    try:
+        items = _github_get(FIRMWARE_PATH)
+        parts = sorted(
+            item['name']
+            for item in items
+            if item['type'] == 'dir' and not item['name'].startswith('.')
+        )
+        return jsonify(parts)
+    except HTTPError as exc:
+        return jsonify({'error': f'GitHub API error: {exc.code}'}), 502
+    except URLError as exc:
+        return jsonify({'error': f'Network error: {exc.reason}'}), 502
 
 
 @app.route('/parts/<part>/firmware', methods=['GET'])
