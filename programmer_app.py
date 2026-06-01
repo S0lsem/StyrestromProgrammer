@@ -15,13 +15,16 @@ import traceback
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QSettings
+from PyQt6.QtGui import QAction, QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -38,6 +41,7 @@ from PyQt6.QtWidgets import (
 
 from types import SimpleNamespace
 
+from mrs_protocol import event_logger
 from mrs_protocol.constants import MODULE_TYPES
 from mrs_protocol.console_flasher import run_flash
 from mrs_protocol.protocol import detect_adapter, scan_plc, ScanError
@@ -112,6 +116,62 @@ class DownloadWorker(QObject):
             self.finished.emit(firmware)
         except Exception as exc:
             self.error.emit(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Operator identity dialog — self-reported distributor + operator initials,
+# persisted via QSettings so HQ can attribute every flash event.
+# ---------------------------------------------------------------------------
+
+class _IdentityDialog(QDialog):
+    def __init__(self, parent, distributor: str, operator: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle('Operator identity')
+        self.setMinimumWidth(360)
+
+        self._distributor_edit = QLineEdit(distributor)
+        self._distributor_edit.setPlaceholderText('e.g. Acme Norway AS')
+        self._operator_edit = QLineEdit(operator)
+        self._operator_edit.setPlaceholderText('e.g. EJS')
+        self._operator_edit.setMaxLength(16)
+
+        form = QFormLayout()
+        form.addRow('Distributor:', self._distributor_edit)
+        form.addRow('Operator initials:', self._operator_edit)
+
+        info = QLabel(
+            'Every flash will be tagged with these so Styrestrøm HQ can '
+            'see which distributor / operator programmed each PLC.'
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet('color: #555; font-size: 11px;')
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        self._buttons = buttons
+
+        root = QVBoxLayout(self)
+        root.addLayout(form)
+        root.addWidget(info)
+        root.addWidget(buttons)
+
+    def _on_accept(self) -> None:
+        if not self._distributor_edit.text().strip():
+            QMessageBox.warning(self, 'Required', 'Distributor name is required.')
+            return
+        if not self._operator_edit.text().strip():
+            QMessageBox.warning(self, 'Required', 'Operator initials are required.')
+            return
+        self.accept()
+
+    def values(self) -> tuple[str, str]:
+        return (
+            self._distributor_edit.text().strip(),
+            self._operator_edit.text().strip(),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -210,10 +270,16 @@ class MainWindow(QMainWindow):
         self._flash_thread:  Optional[QThread]        = None
         self._scan_worker:   Optional[ScanWorker]     = None
         self._scan_thread:   Optional[QThread]        = None
+        self._last_scan_label: str = ''   # carried into the flash event
+
+        self._settings = QSettings('Styrestrom', 'MRS Programmer')
 
         self._build_ui()
+        self._build_menu()
         self._setup_logging()
         self._check_for_updates()
+        self._ensure_identity()
+        event_logger.replay_pending()
 
     # ------------------------------------------------------------------
     # UI
@@ -366,6 +432,44 @@ class MainWindow(QMainWindow):
         self._log_handler.message_emitted.connect(self._append_log)
         logging.getLogger().addHandler(self._log_handler)
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # ------------------------------------------------------------------
+    # Operator identity (persisted via QSettings, posted with every event)
+    # ------------------------------------------------------------------
+
+    def _build_menu(self) -> None:
+        bar = self.menuBar()
+        settings_menu = bar.addMenu('&Settings')
+        action = QAction('&Operator identity…', self)
+        action.triggered.connect(self._on_change_identity)
+        settings_menu.addAction(action)
+
+    def _distributor(self) -> str:
+        return str(self._settings.value('distributor', '', type=str))
+
+    def _operator(self) -> str:
+        return str(self._settings.value('operator', '', type=str))
+
+    def _ensure_identity(self) -> None:
+        """Prompt on first run; subsequent launches read from QSettings."""
+        if self._distributor() and self._operator():
+            return
+        self._prompt_identity(first_run=True)
+
+    def _on_change_identity(self) -> None:
+        self._prompt_identity(first_run=False)
+
+    def _prompt_identity(self, first_run: bool) -> None:
+        dlg = _IdentityDialog(self, self._distributor(), self._operator())
+        if first_run:
+            dlg.setWindowTitle('Welcome — set your operator identity')
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            distributor, operator = dlg.values()
+            self._settings.setValue('distributor', distributor)
+            self._settings.setValue('operator', operator)
+            self._append_log(
+                f'Operator identity set: {operator} @ {distributor}'
+            )
 
     # ------------------------------------------------------------------
     # Update check (runs on startup, background thread)
@@ -586,6 +690,7 @@ class MainWindow(QMainWindow):
 
     def _on_plc_found(self, info) -> None:
         self._last_plc_info = info
+        self._last_scan_label = info.label
         self._append_log(f'PLC detected — SN:{info.serial}  {info.label}')
 
     def _on_flash_done(self) -> None:
@@ -607,6 +712,15 @@ class MainWindow(QMainWindow):
             part=part, module=module, channel=channel, success=True, serial=serial,
         )
         self._append_log(f'Flash logged to {log_path}')
+
+        # Report event to the proxy (with offline fallback)
+        self._post_flash_event(
+            plc_serial=serial,
+            part=part,
+            module=module,
+            channel=channel,
+            result='OK',
+        )
 
         # Generate report
         from mrs_protocol.flash_report import generate_report, save_report
@@ -646,16 +760,75 @@ class MainWindow(QMainWindow):
         self._status_label.setText('Error — see log')
         self._append_log('ERROR:\n' + tb)
 
-        # Log the failure
-        from mrs_protocol.flash_log import write_entry
         part   = self._part_combo.currentText() or '—'
         module = self._module_combo.currentText()
+        info   = self._last_plc_info
+        serial = str(info.serial) if info else ''
+
+        # Log the failure
+        from mrs_protocol.flash_log import write_entry
         write_entry(
             part=part, module=module, channel=self._detected_channel,
             success=False, error_msg=tb[:200],
         )
 
+        # Report failure event to the proxy
+        self._post_flash_event(
+            plc_serial=serial,
+            part=part,
+            module=module,
+            channel=self._detected_channel,
+            result='FAIL',
+            error_message=tb[:500],
+        )
+
         QMessageBox.critical(self, 'Flash failed', 'An error occurred:\n\n' + tb[:500])
+
+    def _post_flash_event(
+        self,
+        *,
+        plc_serial:    str,
+        part:          str,
+        module:        str,
+        channel:       str,
+        result:        str,
+        error_message: str = '',
+    ) -> None:
+        """Send the flash event to the proxy with offline fallback."""
+        distributor = self._distributor()
+        operator    = self._operator()
+        if not distributor or not operator:
+            self._append_log(
+                'Event NOT reported — operator identity is unset. '
+                'Open Settings → Operator identity… to fix.'
+            )
+            return
+
+        event = event_logger.build_event(
+            distributor=distributor,
+            operator=operator,
+            plc_serial=plc_serial,
+            part=part,
+            module=module,
+            channel=channel,
+            result=result,
+            error_message=error_message,
+            scan_label=self._last_scan_label,
+        )
+        response = event_logger.report_event(event)
+        if response is None:
+            self._append_log(
+                'Event queued offline (proxy unreachable); will retry on next launch.'
+            )
+        else:
+            tag = (
+                'FIRST-TIME PROGRAM'
+                if response.get('first_program_for_sn') else
+                'reflash'
+            )
+            self._append_log(
+                f'Event reported to HQ ({tag}) by {operator} @ {distributor}.'
+            )
 
     # ------------------------------------------------------------------
     # Scan handlers

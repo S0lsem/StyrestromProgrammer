@@ -33,8 +33,12 @@ Expected repo layout (private GitHub repo, owner/name set below):
 from __future__ import annotations
 
 import base64
+import html
 import json
 import os
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -43,13 +47,17 @@ from flask import Flask, jsonify, request, abort, Response
 app = Flask(__name__)
 
 # ---------- Configuration ----------
-GITHUB_TOKEN  = os.environ.get('GITHUB_TOKEN', '')
-PROXY_API_KEY = os.environ.get('PROXY_API_KEY', '')
+GITHUB_TOKEN    = os.environ.get('GITHUB_TOKEN', '')
+PROXY_API_KEY   = os.environ.get('PROXY_API_KEY', '')
+ADMIN_API_KEY   = os.environ.get('ADMIN_API_KEY', '')
 GITHUB_OWNER = 'S0lsem'
 GITHUB_REPO = 'Code-for-Highbeam-X'
 FIRMWARE_PATH = 'mrs-firmware'
 
 _API = 'https://api.github.com'
+
+# SQLite for flash-event tracking. Created next to this file.
+_DB_PATH = str(Path(__file__).parent / 'events.db')
 
 
 def _check_api_key():
@@ -135,3 +143,247 @@ def get_firmware(part: str):
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'})
+
+
+# ---------------------------------------------------------------------------
+# Flash-event tracking — every flash attempt posted by the programmer lands
+# here so Styrestrøm HQ can see who programmed what.
+# ---------------------------------------------------------------------------
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS events (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    received_ts_utc      TEXT    NOT NULL,
+    client_ts_utc        TEXT    NOT NULL,
+    distributor          TEXT    NOT NULL,
+    operator             TEXT    NOT NULL,
+    plc_serial           TEXT    NOT NULL,
+    part                 TEXT    NOT NULL,
+    module               TEXT,
+    channel              TEXT,
+    result               TEXT    NOT NULL,
+    error_message        TEXT,
+    flasher_exit         INTEGER,
+    scan_label           TEXT,
+    first_program_for_sn INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plc_serial ON events(plc_serial);
+CREATE INDEX IF NOT EXISTS idx_received   ON events(received_ts_utc);
+"""
+
+
+def _db():
+    conn = sqlite3.connect(_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db():
+    with _db() as conn:
+        conn.executescript(_SCHEMA)
+
+
+_init_db()
+
+
+def _check_admin_key():
+    """Return None if the caller is authenticated as admin, else a Response.
+
+    Accepts two equivalent credentials so both browser and curl work:
+      - ``X-Admin-Key: <ADMIN_API_KEY>`` header (curl / scripting).
+      - HTTP Basic Auth where the password equals ``ADMIN_API_KEY``
+        (the username can be anything — browser prompts you for both).
+    """
+    if not ADMIN_API_KEY:
+        return Response('Server has no ADMIN_API_KEY set.', status=503)
+
+    key = request.headers.get('X-Admin-Key', '')
+    if key and key == ADMIN_API_KEY:
+        return None
+
+    auth = request.authorization
+    if auth and auth.password == ADMIN_API_KEY:
+        return None
+
+    return Response(
+        'Authentication required.',
+        status=401,
+        headers={'WWW-Authenticate': 'Basic realm="MRS Flash Events"'},
+    )
+
+
+@app.route('/log_flash', methods=['POST'])
+def log_flash():
+    """Ingest one flash event from a distributor's programmer."""
+    _check_api_key()
+
+    if not request.is_json:
+        return jsonify({'error': 'expected application/json'}), 400
+    event = request.get_json(silent=True) or {}
+
+    required = ('distributor', 'operator', 'plc_serial', 'part', 'result')
+    missing = [k for k in required if not str(event.get(k, '')).strip()]
+    if missing:
+        return jsonify({'error': f'missing fields: {", ".join(missing)}'}), 400
+
+    plc_serial = str(event['plc_serial']).strip()
+    result     = str(event['result']).strip().upper()
+    received   = datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+    with _db() as conn:
+        prior_ok = conn.execute(
+            "SELECT 1 FROM events WHERE plc_serial = ? AND result = 'OK' LIMIT 1",
+            (plc_serial,),
+        ).fetchone()
+        first = 0 if prior_ok else (1 if result == 'OK' else 0)
+
+        conn.execute(
+            """
+            INSERT INTO events (
+                received_ts_utc, client_ts_utc, distributor, operator,
+                plc_serial, part, module, channel, result, error_message,
+                flasher_exit, scan_label, first_program_for_sn
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                received,
+                str(event.get('timestamp_utc', '')).strip(),
+                str(event['distributor']).strip(),
+                str(event['operator']).strip(),
+                plc_serial,
+                str(event['part']).strip(),
+                str(event.get('module', '')).strip(),
+                str(event.get('channel', '')).strip(),
+                result,
+                str(event.get('error_message', '')),
+                int(event.get('flasher_exit') or 0),
+                str(event.get('scan_label', '')),
+                first,
+            ),
+        )
+
+    return jsonify({'ok': True, 'first_program_for_sn': bool(first)})
+
+
+@app.route('/admin/events', methods=['GET'])
+def admin_events():
+    """Minimal HTML table of recent events. Auth via X-Admin-Key header.
+
+    Query params: distributor, part, plc_serial, since (ISO date),
+    limit (default 200, max 1000), offset (default 0).
+    """
+    denied = _check_admin_key()
+    if denied is not None:
+        return denied
+
+    args = request.args
+    where: list[str] = []
+    params: list = []
+    for col, key in (
+        ('distributor', 'distributor'),
+        ('part', 'part'),
+        ('plc_serial', 'plc_serial'),
+    ):
+        if args.get(key):
+            where.append(f'{col} LIKE ?')
+            params.append(f'%{args[key]}%')
+    if args.get('since'):
+        where.append('received_ts_utc >= ?')
+        params.append(args['since'])
+
+    try:
+        limit = max(1, min(int(args.get('limit', 200)), 1000))
+    except ValueError:
+        limit = 200
+    try:
+        offset = max(0, int(args.get('offset', 0)))
+    except ValueError:
+        offset = 0
+
+    sql = 'SELECT * FROM events'
+    if where:
+        sql += ' WHERE ' + ' AND '.join(where)
+    sql += ' ORDER BY id DESC LIMIT ? OFFSET ?'
+    params.extend([limit, offset])
+
+    with _db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+        total = conn.execute('SELECT COUNT(*) FROM events').fetchone()[0]
+
+    return Response(_render_events_html(rows, total, args, limit, offset),
+                    mimetype='text/html; charset=utf-8')
+
+
+def _render_events_html(rows, total, args, limit, offset) -> str:
+    cols = ('id', 'received_ts_utc', 'distributor', 'operator', 'plc_serial',
+            'part', 'result', 'first_program_for_sn', 'scan_label',
+            'error_message')
+    head = ''.join(f'<th>{c}</th>' for c in cols)
+
+    body_rows = []
+    for r in rows:
+        cells = []
+        for c in cols:
+            v = r[c]
+            if c == 'first_program_for_sn':
+                v = 'FIRST' if v else ''
+            cells.append(f'<td>{html.escape(str(v or ""))}</td>')
+        cls = 'first' if r['first_program_for_sn'] else ''
+        body_rows.append(f'<tr class="{cls}">{"".join(cells)}</tr>')
+    body = '\n'.join(body_rows) or '<tr><td colspan="10">No events match.</td></tr>'
+
+    def hidden_inputs():
+        out = []
+        for k in ('distributor', 'part', 'plc_serial', 'since'):
+            if args.get(k):
+                out.append(
+                    f'<input type="hidden" name="{k}" value="{html.escape(args[k])}">'
+                )
+        return ''.join(out)
+
+    prev_off = max(0, offset - limit)
+    next_off = offset + limit
+    pager = (
+        f'<p>Showing rows {offset+1}–{offset+len(rows)} of {total}. '
+        f'<a href="?{_qs(args, offset=prev_off, limit=limit)}">« prev</a> '
+        f'<a href="?{_qs(args, offset=next_off, limit=limit)}">next »</a></p>'
+    )
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>MRS Flash Events</title>
+<style>
+ body {{ font-family: -apple-system, Segoe UI, sans-serif; margin: 20px; }}
+ form  {{ margin-bottom: 12px; }}
+ input {{ margin-right: 6px; padding: 4px; }}
+ table {{ border-collapse: collapse; font-size: 12px; }}
+ th, td {{ border: 1px solid #ccc; padding: 4px 8px; text-align: left;
+          vertical-align: top; }}
+ th    {{ background: #eee; position: sticky; top: 0; }}
+ tr.first td {{ background: #e6ffe6; font-weight: bold; }}
+ a {{ text-decoration: none; color: #1a7fd4; }}
+</style></head><body>
+<h1>MRS Flash Events</h1>
+<form method="get">
+  <input name="distributor" placeholder="distributor" value="{html.escape(args.get('distributor',''))}">
+  <input name="part"        placeholder="part"        value="{html.escape(args.get('part',''))}">
+  <input name="plc_serial"  placeholder="PLC serial"  value="{html.escape(args.get('plc_serial',''))}">
+  <input name="since"       placeholder="since (YYYY-MM-DD)" value="{html.escape(args.get('since',''))}">
+  <input name="limit"       value="{limit}" size="4">
+  <button type="submit">Filter</button>
+  <a href="/admin/events">clear</a>
+</form>
+{pager}
+<table>
+  <thead><tr>{head}</tr></thead>
+  <tbody>{body}</tbody>
+</table>
+{pager}
+</body></html>"""
+
+
+def _qs(args, **overrides) -> str:
+    """Build a query string preserving filters but overriding offset/limit."""
+    from urllib.parse import urlencode
+    out = {k: v for k, v in args.items() if v}
+    out.update({k: v for k, v in overrides.items() if v is not None})
+    return urlencode(out)
