@@ -34,7 +34,7 @@ _FLASHER_EXE_NAME = 'MRS_Developers_Studio_Console.exe'
 
 _PROGRESS_RE     = re.compile(r'\]\s*(\d+)%')
 _SCAN_HEADER_RE  = re.compile(r'Module\(s\) found')
-_SCAN_LINE_RE    = re.compile(r'^(\d+)\s+(NO PROG|PROG)\s*:\s*(.+)$')
+_SCAN_LINE_RE    = re.compile(r'^(\d+)\s+(NO PROG|PROG|OK)\s*:\s*(.+)$')
 _FINISHED_RE     = re.compile(
     r'Programm\s+finshed:\s+0x([0-9A-Fa-f]+)\s+\((\d+)\):\s*(.*)'
 )
