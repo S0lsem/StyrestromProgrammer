@@ -36,8 +36,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from types import SimpleNamespace
+
 from mrs_protocol.constants import MODULE_TYPES
-from mrs_protocol.protocol import MRSFlashEngine
+from mrs_protocol.console_flasher import run_flash
+from mrs_protocol.protocol import detect_adapter
 from mrs_protocol.s19_parser import Firmware
 from mrs_protocol.version import APP_VERSION
 
@@ -83,7 +86,7 @@ class _CheckAdapterWorker(QObject):
         self._data_bitrate = data_bitrate
 
     def run(self) -> None:
-        ok, channel, msg = MRSFlashEngine.detect_adapter(
+        ok, channel, msg = detect_adapter(
             self._bitrate, self._is_can_fd, self._data_bitrate
         )
         self.result.emit(ok, channel, msg)
@@ -117,43 +120,36 @@ class DownloadWorker(QObject):
 
 class FlashWorker(QObject):
     progress   = pyqtSignal(float, str)
-    plc_found  = pyqtSignal(object)   # PLCInfo
+    plc_found  = pyqtSignal(object)   # SimpleNamespace(serial=str, label=str)
     finished   = pyqtSignal()
     error      = pyqtSignal(str)
 
-    def __init__(
-        self,
-        firmware:     Firmware,
-        channel:      str,
-        bitrate:      int,
-        is_can_fd:    bool,
-        data_bitrate: int = 0,
-    ) -> None:
+    def __init__(self, firmware: Firmware) -> None:
         super().__init__()
-        self._firmware     = firmware
-        self._channel      = channel
-        self._bitrate      = bitrate
-        self._is_can_fd    = is_can_fd
-        self._data_bitrate = data_bitrate
+        self._firmware = firmware
 
     def run(self) -> None:
         try:
-            with MRSFlashEngine(
-                channel=self._channel,
-                bitrate=self._bitrate,
-                is_can_fd=self._is_can_fd,
-                data_bitrate=self._data_bitrate,
-            ) as engine:
-                # Wait for PLC to boot
-                self.progress.emit(0.0, 'Waiting for PLC — power on the unit now…')
-                info = engine.wait_for_plc(
-                    timeout=30.0,
-                    progress=self.progress.emit,
-                )
-                self.plc_found.emit(info)
-                # Flash
-                engine.flash(self._firmware, progress=self.progress.emit)
-            self.finished.emit()
+            def _on_plc(sn: str, label: str) -> None:
+                self.plc_found.emit(SimpleNamespace(serial=sn, label=label))
+
+            result = run_flash(
+                self._firmware,
+                progress=self.progress.emit,
+                plc_found=_on_plc,
+            )
+
+            if result.success:
+                self.finished.emit()
+                return
+
+            detail = result.error_message or f'exit code {result.exit_code}'
+            if result.error_code:
+                detail = f'0x{result.error_code:02X} ({result.error_code}): {detail}'
+            self.error.emit(
+                f'Console flasher reported failure: {detail}\n\n'
+                f'--- flasher output ---\n{result.output}'
+            )
         except Exception as exc:
             self.error.emit(
                 ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -502,22 +498,18 @@ class MainWindow(QMainWindow):
             return
 
         module_name  = self._module_combo.currentText()
-        cfg          = MODULE_TYPES[module_name]
         channel      = self._detected_channel
-        bitrate      = cfg['bitrate']
-        is_can_fd    = cfg['can_fd']
-        data_bitrate = cfg['data_bitrate']
         firmware     = self._firmware
 
         self._last_plc_info = None
         self._flash_btn.setEnabled(False)
         self._download_btn.setEnabled(False)
         self._progress_bar.setValue(0)
-        self._status_label.setText('Waiting for PLC — power on the unit now…')
+        self._status_label.setText('Starting MRS console flasher…')
         self._append_log(f'Starting flash — module: {module_name}  channel: {channel}')
-        self._append_log('Power on the PLC now (or power-cycle it)…')
+        self._append_log('Console flasher will detect the PLC; power-cycle it if needed.')
 
-        self._flash_worker = FlashWorker(firmware, channel, bitrate, is_can_fd, data_bitrate)
+        self._flash_worker = FlashWorker(firmware)
         self._flash_thread = QThread()
         self._flash_worker.moveToThread(self._flash_thread)
 
@@ -538,10 +530,7 @@ class MainWindow(QMainWindow):
 
     def _on_plc_found(self, info) -> None:
         self._last_plc_info = info
-        self._append_log(
-            f'PLC detected — SN:{info.serial} Article:{info.article} '
-            f'Rev:{info.revision} App:{info.app_name} {info.app_version}'
-        )
+        self._append_log(f'PLC detected — SN:{info.serial}  {info.label}')
 
     def _on_flash_done(self) -> None:
         self._flash_btn.setEnabled(True)

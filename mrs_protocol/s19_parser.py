@@ -39,9 +39,14 @@ class Firmware:
         data:           Contiguous bytes covering start_address to the end
                         of the highest-addressed record. Gaps between
                         records are filled with 0xFF.
+        s19_text:       The original S-record text that produced this image.
+                        Retained so the console-flasher wrapper can write
+                        it back out to a tempfile (the MRS flasher reads
+                        from a real path, not from memory).
     """
     start_address: int
     data:          bytes
+    s19_text:      str
 
     def __len__(self) -> int:
         return len(self.data)
@@ -114,4 +119,4 @@ def parse_s19(text: str) -> Firmware:
         offset = addr - min_addr
         image[offset: offset + len(data)] = data
 
-    return Firmware(start_address=min_addr, data=bytes(image))
+    return Firmware(start_address=min_addr, data=bytes(image), s19_text=text)

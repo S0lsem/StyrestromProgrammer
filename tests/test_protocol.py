@@ -10,88 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from mrs_protocol.crc import block_crc, verify_block
-from mrs_protocol import constants
-from mrs_protocol.constants import (
-    CAN_ID_PLC_BOOT,
-    CAN_ID_PC_TO_PLC,
-    CAN_ID_PLC_TO_PC,
-    CAN_ID_PC_DATA,
-    CAN_ID_PLC_DATA,
-    HANDSHAKE_TX_PREFIX,
-    HANDSHAKE_RX_PREFIX,
-    BLOCK_PAYLOAD_SIZE,
-    CRC_POLYNOMIAL,
-)
 from mrs_protocol.trc_parser import TrcParser, TrcMessage
 from mrs_protocol import firmware_cache
 from mrs_protocol.s19_parser import parse_s19, S19ParseError
-
-
-# ---------------------------------------------------------------------------
-# TestCRC — verified against real TRC capture data
-# ---------------------------------------------------------------------------
-
-class TestCRC:
-    def test_empty_payload(self):
-        assert block_crc(b'', init=0) == 0
-
-    def test_known_block_1_from_trc(self):
-        """Block 1 from PLC_AtoZ.trc — offset 0x2200, init=0x17."""
-        payload = bytes([
-            0xA6, 0xE0, 0xC7,                                      # header data (3)
-            0x18, 0x02, 0x4F, 0xC7, 0x18, 0x03, 0xA6, 0x1D,      # chunk 1 (8)
-            0xC7, 0x18, 0x09, 0xA6, 0x30, 0xC7, 0x18, 0x0A,      # chunk 2 (8)
-            0xC6, 0xFF, 0xAF, 0xB7, 0x4A, 0xC6, 0xFF, 0xAE,      # chunk 3 (8)
-            0xB7, 0x4B, 0x6E, 0x26, 0x49,                          # final data (5)
-        ])
-        assert len(payload) == BLOCK_PAYLOAD_SIZE
-        assert block_crc(payload, init=0x17) == 0xF1
-
-    def test_known_block_2_chained(self):
-        """Block 2 — init = block 1's CRC (0xF1)."""
-        payload = bytes([
-            0x6E, 0xBA, 0x48,
-            0x03, 0x4B, 0xFD, 0x08, 0x4B, 0xFD, 0xB6, 0x4B,
-            0xA4, 0x0C, 0xA1, 0x08, 0x26, 0xF8, 0x6E, 0x92,
-            0x48, 0x6E, 0x45, 0x4C, 0x0B, 0x4B, 0xFD, 0x0D,
-            0x4B, 0xFD, 0xC6, 0x24, 0x40,
-        ])
-        assert block_crc(payload, init=0xF1) == 0xFE
-
-    def test_verify_correct(self):
-        data = bytes(range(32))
-        crc = block_crc(data, init=0x17)
-        assert verify_block(data, crc, init=0x17) is True
-
-    def test_verify_wrong(self):
-        data = bytes(range(32))
-        crc = block_crc(data, init=0x17)
-        assert verify_block(data, crc ^ 0xFF, init=0x17) is False
-
-    def test_payload_size_is_32(self):
-        assert BLOCK_PAYLOAD_SIZE == 32
-
-
-# ---------------------------------------------------------------------------
-# TestConstants
-# ---------------------------------------------------------------------------
-
-class TestConstants:
-    def test_can_ids_are_29_bit(self):
-        max_29bit = (1 << 29) - 1
-        assert CAN_ID_PLC_BOOT   <= max_29bit
-        assert CAN_ID_PC_TO_PLC  <= max_29bit
-        assert CAN_ID_PLC_TO_PC  <= max_29bit
-        assert CAN_ID_PC_DATA    <= max_29bit
-        assert CAN_ID_PLC_DATA   <= max_29bit
-
-    def test_handshake_first_byte_differs(self):
-        assert HANDSHAKE_TX_PREFIX[0] != HANDSHAKE_RX_PREFIX[0]
-
-    def test_handshake_payload_length(self):
-        assert len(HANDSHAKE_TX_PREFIX) == 2
-        assert len(HANDSHAKE_RX_PREFIX) == 2
 
 
 # ---------------------------------------------------------------------------

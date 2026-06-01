@@ -59,7 +59,7 @@ def download_part(
     """Download the firmware for *part* via the proxy, cache it, and parse it.
 
     Returns the parsed :class:`Firmware` image ready to be passed to
-    ``MRSFlashEngine.flash()``.
+    :func:`mrs_protocol.console_flasher.run_flash`.
     """
     if progress:
         progress(0.0, f'Downloading {part}…')
