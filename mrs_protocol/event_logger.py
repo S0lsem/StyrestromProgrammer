@@ -1,20 +1,22 @@
 """
-Flash event reporter — posts every flash attempt to the Styrestrøm proxy
-so HQ can see what each distributor is doing.
+Flash event reporter — posts every flash attempt to a Google Apps Script
+Web App that appends one row per event to an HQ-owned Google Sheet so
+Styrestrøm can watch flashes happen across all distributors in real time.
 
-The proxy stores events in SQLite keyed by PLC serial; the response
-indicates whether this was the first time that SN was successfully
-programmed by anyone (any distributor) or a reflash.
+The Apps Script computes first-program-for-SN by scanning prior rows
+and returns it on the response so the GUI can log "FIRST-TIME PROGRAM"
+vs "reflash".
 
 Identity is self-reported via two QSettings values:
     distributor_name  — set once per install on first run
     operator_initials — set once per install on first run
 Both are writable from the GUI's Settings dialog.
 
-Offline behaviour: if the POST fails (network down, proxy unreachable,
-proxy down), the event is appended to ``pending_events.jsonl`` in the
-user's local data dir and replayed on the next launch / next successful
-POST. The local cache never expires — events eventually reach HQ.
+Offline behaviour: if the POST fails (network down, Apps Script down,
+endpoint not yet deployed), the event is appended to
+``pending_events.jsonl`` in the user's local data dir and replayed on
+the next launch / next successful POST. The local cache never expires
+— events eventually reach the sheet.
 """
 from __future__ import annotations
 
@@ -28,7 +30,10 @@ from urllib.request import Request, urlopen
 
 log = logging.getLogger(__name__)
 
-_POST_TIMEOUT = 4.0  # seconds — short so a flaky network doesn't block the GUI
+# Apps Script Web Apps redirect from script.google.com → script.googleusercontent.com
+# and the underlying execution can take 5–10 s on a cold start. 15 s keeps the
+# GUI responsive while leaving headroom for the redirect-and-execute round trip.
+_POST_TIMEOUT = 15.0
 
 
 def _pending_path() -> Path:
@@ -90,28 +95,35 @@ def replay_pending() -> int:
 
 def _post(event: dict) -> Optional[dict]:
     try:
-        from .config import PROXY_URL, PROXY_API_KEY
+        from .config import EVENTS_URL, EVENTS_SECRET
     except ImportError:
         log.warning('mrs_protocol.config not available — event not sent')
         return None
 
-    url = f'{PROXY_URL.rstrip("/")}/log_flash'
-    body = json.dumps(event).encode('utf-8')
+    if not EVENTS_URL:
+        # Endpoint not configured yet — queue silently rather than warn.
+        return None
+
+    body_dict = dict(event, shared_secret=EVENTS_SECRET)
+    body = json.dumps(body_dict).encode('utf-8')
     headers = {
         'Content-Type': 'application/json',
         'Accept':       'application/json',
     }
-    if PROXY_API_KEY:
-        headers['X-Api-Key'] = PROXY_API_KEY
 
-    req = Request(url, data=body, headers=headers, method='POST')
+    req = Request(EVENTS_URL, data=body, headers=headers, method='POST')
     try:
         with urlopen(req, timeout=_POST_TIMEOUT) as resp:
             payload = resp.read()
             try:
-                return json.loads(payload) if payload else {}
+                parsed = json.loads(payload) if payload else {}
             except ValueError:
-                return {}
+                return None
+            # Apps Script returns 200 even on app-level errors; flag via 'ok'.
+            if not parsed.get('ok'):
+                log.warning('Event POST rejected: %s', parsed.get('error', '?'))
+                return None
+            return parsed
     except HTTPError as exc:
         log.warning('Event POST returned HTTP %d', exc.code)
         return None
