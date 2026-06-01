@@ -81,9 +81,15 @@ def find_console_flasher() -> Path:
         )
 
     if getattr(sys, 'frozen', False):
-        bundled = Path(sys.executable).parent / 'ConsoleFlasher' / _FLASHER_EXE_NAME
-        if bundled.is_file():
-            return bundled
+        # PyInstaller one-file mode extracts datas to ``sys._MEIPASS``; one-dir
+        # mode leaves them next to the exe. Check both so the spec can switch
+        # between modes without code changes.
+        for root in (getattr(sys, '_MEIPASS', None), Path(sys.executable).parent):
+            if not root:
+                continue
+            bundled = Path(root) / 'ConsoleFlasher' / _FLASHER_EXE_NAME
+            if bundled.is_file():
+                return bundled
 
     appdata = os.environ.get('LOCALAPPDATA')
     if appdata:
