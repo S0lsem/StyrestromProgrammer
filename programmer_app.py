@@ -865,10 +865,28 @@ class MainWindow(QMainWindow):
         info    = self._last_plc_info
         serial  = str(info.serial) if info else ''
 
+        # Extract the firmware version we just wrote from the parsed .s19
+        # bytes. The pre-flash scan label only reflects the empty-PLC defaults
+        # (e.g. "Modulname : ----V0.1"), so HQ needs the post-flash version
+        # too to know what landed on the unit.
+        from mrs_protocol.s19_parser import extract_app_version
+        wrote_version = (
+            extract_app_version(self._firmware.data) if self._firmware else ''
+        )
+        if wrote_version:
+            self._append_log(f'Firmware version written: {wrote_version}')
+            if self._last_scan_label:
+                self._last_scan_label = (
+                    f'{self._last_scan_label}  →  wrote {wrote_version}'
+                )
+            else:
+                self._last_scan_label = f'wrote {wrote_version}'
+
         # Write flash log
         from mrs_protocol.flash_log import write_entry
         log_path = write_entry(
             part=part, module=module, channel=channel, success=True, serial=serial,
+            sw_version=wrote_version,
             distributor=self._distributor(), operator=self._operator(),
         )
         self._append_log(f'Flash logged to {log_path}')

@@ -22,7 +22,28 @@ onto the PLC's flash from start_address upward.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+
+
+# Best-effort firmware-version extractor.
+# After flashing, the PLC's info-memory app_version field (read by our SCAN
+# at 0x6B–0x7E) contains a string like ``V: 0.17.0`` or ``V0.17.0``. The same
+# string lives literally in the compiled flash image (typically defined as
+# ``APPL_VERSION`` in Dsl_cfg.h), so we can recover the version we just wrote
+# by searching the parsed firmware bytes for that pattern — without having
+# to power-cycle the PLC and re-SCAN.
+_APP_VERSION_RE = re.compile(rb'V\s*:?\s*(\d+\.\d+\.\d+)')
+
+
+def extract_app_version(data: bytes) -> str:
+    """Return the firmware's APPL_VERSION as ``'V: X.Y.Z'`` or ``''`` if
+    no version-shaped string is found in *data*. Heuristic — best-effort.
+    """
+    m = _APP_VERSION_RE.search(data)
+    if not m:
+        return ''
+    return f'V: {m.group(1).decode("ascii")}'
 
 
 class S19ParseError(ValueError):
