@@ -85,7 +85,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='MRS_Programmer',
+    name='Styrestrom_Programmer',
     debug=False,
     strip=False,
     upx=True,

@@ -172,7 +172,7 @@ def run_flash(
             *extra_args,
         ]
         log.info('Spawning flasher: %s', ' '.join(cmd))
-        progress(0.0, 'Starting MRS console flasher…')
+        progress(0.0, 'Starter flasher…')
 
         # CREATE_NO_WINDOW prevents a stray console window in dev runs.
         creationflags = 0x08000000 if os.name == 'nt' else 0

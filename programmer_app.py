@@ -1,5 +1,5 @@
 """
-MRS PLC Programmer — PyQt6 desktop application.
+Styrestrøm AS PLC Programmer — PyQt6 desktop application.
 
 Distributor-facing flashing tool. Operator picks a part, the firmware is
 fetched from the Styrestrøm proxy (never exposed as files on disk), and
@@ -327,7 +327,8 @@ class MainWindow(QMainWindow):
         self._batch_thread:   Optional[QThread]             = None
         self._last_scan_label: str = ''   # carried into the flash event
 
-        self._settings = QSettings('Styrestrom', 'MRS Programmer')
+        self._settings = QSettings('Styrestrom', 'Styrestrom PLC Programmer')
+        self._migrate_legacy_settings()
 
         self._build_ui()
         self._build_menu()
@@ -493,6 +494,22 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Operator identity (persisted via QSettings, posted with every event)
     # ------------------------------------------------------------------
+
+    def _migrate_legacy_settings(self) -> None:
+        """Carry distributor + operator over from the old "MRS Programmer"
+        QSettings key (v1.0.0–v1.0.2) so the upgraded install does not
+        re-prompt operators who already filled in their identity."""
+        new_has = (
+            self._settings.contains('distributor')
+            or self._settings.contains('operator')
+        )
+        if new_has:
+            return
+        legacy = QSettings('Styrestrom', 'MRS Programmer')
+        for key in ('distributor', 'operator'):
+            value = legacy.value(key, '', type=str)
+            if value:
+                self._settings.setValue(key, value)
 
     def _build_menu(self) -> None:
         bar = self.menuBar()
@@ -824,7 +841,7 @@ class MainWindow(QMainWindow):
         self._flash_btn.setEnabled(False)
         self._download_btn.setEnabled(False)
         self._progress_bar.setValue(0)
-        self._status_label.setText('Starting MRS console flasher…')
+        self._status_label.setText('Starter flasher…')
         self._append_log(f'Starting flash — module: {module_name}  channel: {channel}')
         self._append_log('Console flasher will detect the PLC; power-cycle it if needed.')
 
