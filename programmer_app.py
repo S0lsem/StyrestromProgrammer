@@ -40,8 +40,22 @@ from PyQt6.QtWidgets import (
 )
 
 from types import SimpleNamespace
+import re
 
 from mrs_protocol import event_logger
+
+
+_VERSION_NUMBER_RE = re.compile(r'\d+\.\d+(?:\.\d+)?')
+
+
+def _version_number(text: str) -> str:
+    """Pull the bare ``X.Y`` / ``X.Y.Z`` digits out of strings like
+    ``'V: 0.17.0'``, ``'----V0.1'``, or ``'0.17.0'``. Returns '' for empty
+    or unparseable input."""
+    if not text:
+        return ''
+    m = _VERSION_NUMBER_RE.search(text)
+    return m.group(0) if m else ''
 from mrs_protocol.constants import MODULE_TYPES
 from mrs_protocol.console_flasher import run_flash
 from mrs_protocol.protocol import detect_adapter, scan_plc, ScanError
@@ -862,12 +876,22 @@ class MainWindow(QMainWindow):
 
     def _on_progress(self, fraction: float, message: str) -> None:
         self._progress_bar.setValue(int(fraction * 100))
-        self._status_label.setText(message)
+        if message:
+            self._status_label.setText(message)
 
     def _on_plc_found(self, info) -> None:
         self._last_plc_info = info
         self._last_scan_label = info.label
         self._append_log(f'PLC detected — SN:{info.serial}  {info.label}')
+        # Status line shows SN + the SW currently on the PLC (extracted
+        # from the flasher's SCAN line, e.g. "...: V: 0.17.0"). The
+        # post-flash version we are about to write goes into the
+        # event/CSV separately via _on_flash_done.
+        sw = _version_number(info.label)
+        label = f'PLC detected — SN {info.serial}'
+        if sw:
+            label += f'  SW: {sw}'
+        self._status_label.setText(label)
 
     def _on_flash_done(self) -> None:
         self._flash_btn.setEnabled(True)
@@ -1080,7 +1104,11 @@ class MainWindow(QMainWindow):
         self._scan_btn.setEnabled(True)
         self._check_conn_btn.setEnabled(True)
         self._flash_btn.setEnabled(True)
-        self._status_label.setText(f'PLC found — SN {info.serial}')
+        sw = _version_number(info.app_version)
+        status = f'PLC found — SN {info.serial}'
+        if sw:
+            status += f'  SW: {sw}'
+        self._status_label.setText(status)
 
         self._append_log(f'PLC FOUND — SN: {info.serial}')
         self._append_log(f'  Article:     {info.article}')

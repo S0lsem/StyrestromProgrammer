@@ -260,7 +260,9 @@ def _consume_line(
             result.serial       = m.group(1)
             result.module_label = f'{m.group(2)} : {m.group(3)}'
             plc_found(result.serial, result.module_label)
-            progress(0.05, f'PLC detected — SN {result.serial}')
+            # plc_found's slot updates the status with SN + SW from the
+            # loaded .s19. Emit progress with no text so we don't clobber it.
+            progress(0.05, '')
             scan_state[0] = False
             return
 
