@@ -210,6 +210,59 @@ class ScanWorker(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Batch listener — between flashes in batch mode, watches for the next PLC's
+# boot announcement so the GUI can auto-trigger the next flash. The bus is
+# released as soon as the announcement is seen because the console flasher
+# needs exclusive PCAN access.
+# ---------------------------------------------------------------------------
+
+class BatchListenerWorker(QObject):
+    plc_detected = pyqtSignal(int)   # serial decoded from boot announcement
+    error        = pyqtSignal(str)
+
+    def __init__(self, channel: str) -> None:
+        super().__init__()
+        self._channel = channel
+        self._stop = False
+
+    def request_stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        from mrs_protocol.protocol import CAN_ID_PLC_BOOT
+        import can
+        try:
+            bus = can.Bus(
+                interface='pcan',
+                channel=self._channel,
+                bitrate=125000,
+                fd=False,
+            )
+        except Exception as exc:
+            self.error.emit(f'Batch listener could not open PCAN at 125k: {exc}')
+            return
+
+        serial = 0
+        try:
+            while not self._stop:
+                msg = bus.recv(timeout=0.5)
+                if msg is None:
+                    continue
+                if msg.arbitration_id == CAN_ID_PLC_BOOT and len(msg.data) >= 5:
+                    data = bytes(msg.data)
+                    serial = (data[2] << 16) | (data[3] << 8) | data[4]
+                    break
+        finally:
+            try:
+                bus.shutdown()
+            except Exception:
+                pass
+
+        if not self._stop:
+            self.plc_detected.emit(serial)
+
+
+# ---------------------------------------------------------------------------
 # Flash worker — runs the CAN flash sequence in a QThread
 # ---------------------------------------------------------------------------
 
@@ -258,7 +311,7 @@ class FlashWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(f'MRS PLC Programmer v{APP_VERSION} — Styrestrøm AS')
+        self.setWindowTitle(f'Styrestrøm AS PLC Programmer V. {APP_VERSION}')
         self.setMinimumSize(720, 700)
 
         self._firmware: Optional[Firmware] = None
@@ -270,6 +323,8 @@ class MainWindow(QMainWindow):
         self._flash_thread:  Optional[QThread]        = None
         self._scan_worker:   Optional[ScanWorker]     = None
         self._scan_thread:   Optional[QThread]        = None
+        self._batch_listener: Optional[BatchListenerWorker] = None
+        self._batch_thread:   Optional[QThread]             = None
         self._last_scan_label: str = ''   # carried into the flash event
 
         self._settings = QSettings('Styrestrom', 'MRS Programmer')
@@ -360,11 +415,13 @@ class MainWindow(QMainWindow):
         # ── Batch mode ────────────────────────────────────────────────
         batch_box = QGroupBox('Batch programming')
         batch_layout = QHBoxLayout(batch_box)
-        self._batch_check = QCheckBox('Keep firmware loaded between flashes')
+        self._batch_check = QCheckBox('Keep firmware loaded + auto-flash on next PLC boot')
         self._batch_check.setToolTip(
-            'When checked, firmware files stay loaded after flashing.\n'
-            'Useful when programming multiple PLCs with the same firmware.'
+            'When checked, firmware stays loaded after flashing and the app\n'
+            'listens for the next PLC to boot. Power-cycle the next PLC and\n'
+            'flashing starts automatically — no need to click Flash PLC.'
         )
+        self._batch_check.stateChanged.connect(self._on_batch_toggled)
         batch_layout.addWidget(self._batch_check)
         batch_layout.addStretch()
         root.addWidget(batch_box)
@@ -622,6 +679,9 @@ class MainWindow(QMainWindow):
             f'Firmware loaded: {self._loaded_part_name} '
             f'({len(firmware):,} bytes from 0x{firmware.start_address:04X})'
         )
+        # If batch was already on when the user downloaded firmware, this
+        # is the moment all preconditions become satisfied.
+        self._maybe_start_batch_listener()
 
     def _on_dl_error(self, msg: str) -> None:
         self._refresh_firmware_label()
@@ -637,10 +697,105 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_clear_firmware(self) -> None:
+        self._stop_batch_listener()
         self._firmware = None
         self._loaded_part_name = ''
         self._refresh_firmware_label()
         self._append_log('Firmware cleared.')
+
+    # ------------------------------------------------------------------
+    # Batch listener — auto-flash next power-cycled PLC
+    # ------------------------------------------------------------------
+
+    def _on_batch_toggled(self, _state: int) -> None:
+        if self._batch_check.isChecked():
+            self._maybe_start_batch_listener()
+        else:
+            self._stop_batch_listener()
+            if not (self._flash_thread and self._flash_thread.isRunning()):
+                self._status_label.setText('Ready')
+
+    def _maybe_start_batch_listener(self) -> None:
+        """Start the listener if all preconditions hold; no-op otherwise."""
+        if not self._batch_check.isChecked():
+            return
+        if self._firmware is None:
+            return
+        if not self._detected_channel:
+            return
+        if self._thread_is_running(self._flash_thread):
+            return
+        if self._thread_is_running(self._batch_thread):
+            return
+        self._start_batch_listener()
+
+    @staticmethod
+    def _thread_is_running(thread) -> bool:
+        """Safe isRunning() — the QThread may have been deleteLater-ed,
+        in which case touching it raises RuntimeError from sip."""
+        if thread is None:
+            return False
+        try:
+            return thread.isRunning()
+        except RuntimeError:
+            return False
+
+    def _start_batch_listener(self) -> None:
+        self._batch_listener = BatchListenerWorker(self._detected_channel)
+        self._batch_thread = QThread()
+        self._batch_listener.moveToThread(self._batch_thread)
+
+        self._batch_thread.started.connect(self._batch_listener.run)
+        self._batch_listener.plc_detected.connect(self._on_batch_plc_detected)
+        self._batch_listener.error.connect(self._on_batch_listener_error)
+        self._batch_listener.plc_detected.connect(self._batch_thread.quit)
+        self._batch_listener.error.connect(self._batch_thread.quit)
+        # Qt-managed cleanup. Order matters: our ref-clear slot fires first
+        # (drops Python refs while wrappers are still valid), then deleteLater
+        # schedules C++ destruction. Without explicit deleteLater the Python
+        # GC can race the Qt event loop and crash on pending signal slots.
+        self._batch_thread.finished.connect(self._on_batch_thread_finished)
+        self._batch_thread.finished.connect(self._batch_listener.deleteLater)
+        self._batch_thread.finished.connect(self._batch_thread.deleteLater)
+
+        self._batch_thread.start()
+        self._status_label.setText('Batch mode — waiting for next PLC…')
+        self._append_log('Batch mode: listening for next PLC boot announcement.')
+
+    def _on_batch_thread_finished(self) -> None:
+        """Drop Python refs once the thread has fully exited. Safe because
+        the connected bound-method slots captured the worker at connect time
+        and don't depend on self._batch_listener."""
+        self._batch_listener = None
+        self._batch_thread = None
+
+    def _stop_batch_listener(self) -> None:
+        if self._batch_listener is None:
+            return
+        self._batch_listener.request_stop()
+        if self._thread_is_running(self._batch_thread):
+            try:
+                self._batch_thread.quit()
+                self._batch_thread.wait(2000)
+            except RuntimeError:
+                pass
+        self._batch_listener = None
+        self._batch_thread = None
+
+    def _on_batch_plc_detected(self, serial: int) -> None:
+        # Ref cleanup happens via _on_batch_thread_finished — touching the
+        # worker/thread refs here while signals are still in flight crashes
+        # Qt.
+        self._append_log(f'Auto-detected PLC SN {serial} on boot — starting flash.')
+        self._on_flash()
+
+    def _on_batch_listener_error(self, msg: str) -> None:
+        self._append_log(f'Batch listener stopped: {msg}')
+        self._status_label.setText('Batch listener error — see log.')
+
+    def closeEvent(self, event) -> None:   # noqa: N802 — Qt method name
+        self._stop_batch_listener()
+        super().closeEvent(event)
 
     def _on_flash(self) -> None:
         if self._firmware is None:
@@ -656,6 +811,10 @@ class MainWindow(QMainWindow):
                 'No PCAN adapter detected.\n\nClick "Detect adapter" first.',
             )
             return
+
+        # If the batch listener is running, stop it — the flasher needs
+        # exclusive PCAN access. We'll restart it after this flash completes.
+        self._stop_batch_listener()
 
         module_name  = self._module_combo.currentText()
         channel      = self._detected_channel
@@ -754,6 +913,9 @@ class MainWindow(QMainWindow):
             self._firmware = None
             self._loaded_part_name = ''
             self._refresh_firmware_label()
+        else:
+            # Firmware stayed loaded → start listening for the next PLC.
+            self._maybe_start_batch_listener()
 
     def _on_flash_error(self, tb: str) -> None:
         self._flash_btn.setEnabled(True)
@@ -785,6 +947,11 @@ class MainWindow(QMainWindow):
         )
 
         QMessageBox.critical(self, 'Flash failed', 'An error occurred:\n\n' + tb[:500])
+
+        # If batch mode is still on and firmware is still loaded, keep
+        # listening for the next PLC — a single bad unit should not abort
+        # an in-progress batch run.
+        self._maybe_start_batch_listener()
 
     def _post_flash_event(
         self,
