@@ -56,6 +56,34 @@ def _version_number(text: str) -> str:
         return ''
     m = _VERSION_NUMBER_RE.search(text)
     return m.group(0) if m else ''
+
+
+def _is_empty_sw(text: str) -> bool:
+    """True if *text* indicates an unprogrammed PLC — the bootloader's
+    default placeholder (``----V0.1``), the flasher SCAN ``NO PROG``
+    status, the ``n/a`` version-field fallback, or an empty string."""
+    if not text:
+        return True
+    t = text.strip()
+    return (
+        not t
+        or 'NO PROG' in t
+        or 'n/a' in t.lower()
+        or '----V' in t
+    )
+
+
+def _format_sw(text: str) -> str:
+    """Return the user-facing SW indicator for the status bar.
+
+    * ``'NO SW installed'`` if the PLC is unprogrammed.
+    * ``'SW: X.Y.Z'`` if a version number can be extracted.
+    * ``''`` if there is no recognisable SW info at all.
+    """
+    if _is_empty_sw(text):
+        return 'NO SW installed'
+    num = _version_number(text)
+    return f'SW: {num}' if num else ''
 from mrs_protocol.constants import MODULE_TYPES
 from mrs_protocol.console_flasher import run_flash
 from mrs_protocol.protocol import detect_adapter, scan_plc, ScanError
@@ -884,13 +912,13 @@ class MainWindow(QMainWindow):
         self._last_scan_label = info.label
         self._append_log(f'PLC detected — SN:{info.serial}  {info.label}')
         # Status line shows SN + the SW currently on the PLC (extracted
-        # from the flasher's SCAN line, e.g. "...: V: 0.17.0"). The
-        # post-flash version we are about to write goes into the
-        # event/CSV separately via _on_flash_done.
-        sw = _version_number(info.label)
+        # from the flasher's SCAN line). An unprogrammed PLC's placeholder
+        # state renders as "NO SW installed". The new version we're about
+        # to write goes into the event/CSV separately via _on_flash_done.
+        sw_display = _format_sw(info.label)
         label = f'PLC detected — SN {info.serial}'
-        if sw:
-            label += f'  SW: {sw}'
+        if sw_display:
+            label += f'  {sw_display}'
         self._status_label.setText(label)
 
     def _on_flash_done(self) -> None:
@@ -1104,17 +1132,23 @@ class MainWindow(QMainWindow):
         self._scan_btn.setEnabled(True)
         self._check_conn_btn.setEnabled(True)
         self._flash_btn.setEnabled(True)
-        sw = _version_number(info.app_version)
+        sw_display = _format_sw(info.app_version)
         status = f'PLC found — SN {info.serial}'
-        if sw:
-            status += f'  SW: {sw}'
+        if sw_display:
+            status += f'  {sw_display}'
         self._status_label.setText(status)
+
+        app_version_display = (
+            'NO SW installed'
+            if _is_empty_sw(info.app_version)
+            else info.app_version
+        )
 
         self._append_log(f'PLC FOUND — SN: {info.serial}')
         self._append_log(f'  Article:     {info.article}')
         self._append_log(f'  Revision:    {info.revision}')
         self._append_log(f'  App name:    {info.app_name}')
-        self._append_log(f'  App version: {info.app_version}')
+        self._append_log(f'  App version: {app_version_display}')
         if info.description:
             self._append_log(f'  Description: {info.description}')
         self._append_log('Power-cycle the PLC again before clicking Flash.')
