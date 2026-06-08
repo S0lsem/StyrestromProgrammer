@@ -25,8 +25,7 @@ def generate_report(
     now = datetime.now()
     lines = [
         '═' * 50,
-        '     MRS PLC FLASH REPORT',
-        '     Styrestrøm AS',
+        '     STYRESTRØM AS — PLC FLASH REPORT',
         '═' * 50,
         '',
         f'  Date:         {now.strftime("%Y-%m-%d")}',

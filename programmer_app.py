@@ -973,6 +973,7 @@ class MainWindow(QMainWindow):
         from mrs_protocol.flash_report import generate_report, save_report
         report = generate_report(
             part=part, module=module, channel=channel, serial=serial,
+            sw_version=wrote_version,
         )
         report_path = save_report(report)
         self._append_log(f'Report saved to {report_path}')
