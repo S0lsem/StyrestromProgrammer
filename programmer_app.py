@@ -368,6 +368,10 @@ class MainWindow(QMainWindow):
         self._batch_listener: Optional[BatchListenerWorker] = None
         self._batch_thread:   Optional[QThread]             = None
         self._last_scan_label: str = ''   # carried into the flash event
+        # Once the operator acknowledges the first "Flash complete" popup
+        # this session, suppress it on every later flash so batch mode is
+        # not interrupted between units. Reports + CSV still get written.
+        self._flash_popup_dismissed: bool = False
 
         self._settings = QSettings('Styrestrom', 'Styrestrom PLC Programmer')
         self._migrate_legacy_settings()
@@ -978,23 +982,29 @@ class MainWindow(QMainWindow):
         report_path = save_report(report)
         self._append_log(f'Report saved to {report_path}')
 
-        # Show result
-        reply = QMessageBox.information(
-            self, 'Flash complete',
-            f'PLC flashed successfully.\n\n'
-            f'Part: {part}\nModule: {module}\n\n'
-            f'Save report to a custom location?',
-            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Ok,
-            QMessageBox.StandardButton.Ok,
-        )
-        if reply == QMessageBox.StandardButton.Save:
-            path, _ = QFileDialog.getSaveFileName(
-                self, 'Save flash report', f'flash_report_{part}.txt',
-                'Text files (*.txt)',
+        # Show result only on the first successful flash of the session —
+        # batch programming is hostile to a popup between every unit.
+        if not self._flash_popup_dismissed:
+            reply = QMessageBox.information(
+                self, 'Flash complete',
+                f'PLC flashed successfully.\n\n'
+                f'Part: {part}\nModule: {module}\n\n'
+                f'Save report to a custom location?\n\n'
+                f'(This confirmation will not appear again this session. '
+                f'Reports are still saved automatically to '
+                f'~/.mrs_programmer/reports/.)',
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Ok,
+                QMessageBox.StandardButton.Ok,
             )
-            if path:
-                save_report(report, directory=Path(path).parent)
-                self._append_log(f'Report saved to {path}')
+            self._flash_popup_dismissed = True
+            if reply == QMessageBox.StandardButton.Save:
+                path, _ = QFileDialog.getSaveFileName(
+                    self, 'Save flash report', f'flash_report_{part}.txt',
+                    'Text files (*.txt)',
+                )
+                if path:
+                    save_report(report, directory=Path(path).parent)
+                    self._append_log(f'Report saved to {path}')
 
         # Batch mode: keep firmware loaded, or clear it
         if not self._batch_check.isChecked():
