@@ -860,6 +860,13 @@ class MainWindow(QMainWindow):
         self._stop_batch_listener()
         super().closeEvent(event)
 
+    def _on_flash_thread_finished(self) -> None:
+        """Drop Python refs once the flash thread has fully exited.
+        Mirrors _on_batch_thread_finished — without it, ~20 rapid batch
+        flashes accumulate stale wrapper state and eventually crash Qt."""
+        self._flash_worker = None
+        self._flash_thread = None
+
     def _on_flash(self) -> None:
         if self._firmware is None:
             QMessageBox.warning(
@@ -902,6 +909,12 @@ class MainWindow(QMainWindow):
         self._flash_worker.error.connect(self._on_flash_error)
         self._flash_worker.finished.connect(self._flash_thread.quit)
         self._flash_worker.error.connect(self._flash_thread.quit)
+        # Qt-managed cleanup so batch programming doesn't race the Python
+        # GC after ~20 rapid flashes. Same pattern as BatchListenerWorker:
+        # clear Python refs first (so any subsequent isRunning() check on
+        # them harmlessly returns False), then deleteLater the C++ objects.
+        self._flash_thread.finished.connect(self._on_flash_thread_finished)
+        self._flash_thread.finished.connect(self._flash_worker.deleteLater)
         self._flash_thread.finished.connect(self._flash_thread.deleteLater)
 
         self._flash_thread.start()
