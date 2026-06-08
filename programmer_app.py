@@ -372,6 +372,11 @@ class MainWindow(QMainWindow):
         # this session, suppress it on every later flash so batch mode is
         # not interrupted between units. Reports + CSV still get written.
         self._flash_popup_dismissed: bool = False
+        # In-app "how to program" guide. Clicking the ? toggles numbered
+        # prefixes on the workflow buttons; this dict remembers the
+        # original button text so we can restore on toggle-off.
+        self._help_active: bool = False
+        self._original_btn_text: dict = {}
 
         self._settings = QSettings('Styrestrom', 'Styrestrom PLC Programmer')
         self._migrate_legacy_settings()
@@ -392,6 +397,23 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setSpacing(8)
+
+        # ── Help (?) button — top-right ────────────────────────────────
+        help_row = QHBoxLayout()
+        help_row.addStretch()
+        self._help_btn = QPushButton('?')
+        self._help_btn.setFixedSize(28, 28)
+        self._help_btn.setToolTip('HOW TO PROGRAM')
+        self._help_btn.setStyleSheet(
+            'QPushButton { border-radius: 14px; font-weight: bold; '
+            'font-size: 14px; background: #1a7fd4; color: white; }'
+            'QPushButton:hover { background: #1565b3; }'
+            'QPushButton:checked { background: #2a8; }'
+        )
+        self._help_btn.setCheckable(True)
+        self._help_btn.clicked.connect(self._toggle_help)
+        help_row.addWidget(self._help_btn)
+        root.addLayout(help_row)
 
         # ── Update banner (hidden by default) ─────────────────────────
         self._update_banner = QLabel()
@@ -418,16 +440,6 @@ class MainWindow(QMainWindow):
         self._check_conn_btn.clicked.connect(self._on_check_connection)
         conn_layout.addWidget(self._check_conn_btn)
 
-        self._scan_btn = QPushButton('Scan PLC')
-        self._scan_btn.setFixedWidth(100)
-        self._scan_btn.setToolTip(
-            'Listen for a PLC boot announcement, then read its identity '
-            '(SN, article, app name + version). Power-cycle the PLC after '
-            'clicking. Read-only — does not erase or flash.'
-        )
-        self._scan_btn.clicked.connect(self._on_scan)
-        conn_layout.addWidget(self._scan_btn)
-
         self._conn_status = QLabel('  Not connected')
         self._conn_status.setStyleSheet('color: #c22; font-weight: bold;')
         conn_layout.addWidget(self._conn_status)
@@ -439,22 +451,32 @@ class MainWindow(QMainWindow):
         gh_box = QGroupBox('Download firmware from Styrestrøm')
         gh_layout = QHBoxLayout(gh_box)
 
+        self._refresh_btn = QPushButton('Refresh list')
+        self._refresh_btn.setFixedWidth(110)
+        self._refresh_btn.clicked.connect(self._on_refresh_parts)
+        gh_layout.addWidget(self._refresh_btn)
+
         gh_layout.addWidget(QLabel('Part:'))
         self._part_combo = QComboBox()
         self._part_combo.setMinimumWidth(260)
         self._part_combo.setPlaceholderText('— click Refresh to load list —')
         gh_layout.addWidget(self._part_combo)
 
-        self._refresh_btn = QPushButton('Refresh list')
-        self._refresh_btn.setFixedWidth(110)
-        self._refresh_btn.clicked.connect(self._on_refresh_parts)
-        gh_layout.addWidget(self._refresh_btn)
-
         self._download_btn = QPushButton('Download')
         self._download_btn.setFixedWidth(110)
         self._download_btn.setEnabled(False)
         self._download_btn.clicked.connect(self._on_download_part)
         gh_layout.addWidget(self._download_btn)
+
+        self._scan_btn = QPushButton('Scan PLC')
+        self._scan_btn.setFixedWidth(100)
+        self._scan_btn.setToolTip(
+            'Listen for a PLC boot announcement, then read its identity '
+            '(SN, article, app name + version). Power-cycle the PLC after '
+            'clicking. Read-only — does not erase or flash.'
+        )
+        self._scan_btn.clicked.connect(self._on_scan)
+        gh_layout.addWidget(self._scan_btn)
 
         gh_layout.addStretch()
         root.addWidget(gh_box)
@@ -536,6 +558,44 @@ class MainWindow(QMainWindow):
         self._log_handler.message_emitted.connect(self._append_log)
         logging.getLogger().addHandler(self._log_handler)
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # ------------------------------------------------------------------
+    # In-app "How to program" guide
+    # ------------------------------------------------------------------
+
+    def _toggle_help(self) -> None:
+        if self._help_active:
+            self._restore_button_text()
+            self._help_active = False
+        else:
+            self._apply_help_numbers()
+            self._help_active = True
+
+    def _apply_help_numbers(self) -> None:
+        """Prefix each workflow button with its step number 1..6."""
+        steps = (
+            (self._check_conn_btn, 1, 'Detect adapter'),
+            (self._refresh_btn,    2, 'Refresh list'),
+            (self._download_btn,   4, 'Download'),
+            (self._scan_btn,       5, 'Scan PLC'),
+            (self._flash_btn,      6, 'Flash PLC'),
+        )
+        for btn, num, _label in steps:
+            self._original_btn_text[btn] = btn.text()
+            btn.setText(f'{num}. {btn.text()}')
+        # Step 3 is the part dropdown — no button text, so we update its
+        # placeholder.
+        self._part_combo.setPlaceholderText(
+            '3. — pick a part from the list —'
+        )
+
+    def _restore_button_text(self) -> None:
+        for btn, original in self._original_btn_text.items():
+            btn.setText(original)
+        self._original_btn_text.clear()
+        self._part_combo.setPlaceholderText(
+            '— click Refresh to load list —'
+        )
 
     # ------------------------------------------------------------------
     # Operator identity (persisted via QSettings, posted with every event)
