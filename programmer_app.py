@@ -103,6 +103,29 @@ class _UpdateCheckWorker(QObject):
         self.result.emit(check_for_update())
 
 
+class _UpdateDownloadWorker(QObject):
+    """Downloads the new .exe in a background thread (network + disk I/O)."""
+    progress = pyqtSignal(float, str)
+    finished = pyqtSignal(str)   # path to the downloaded exe
+    error    = pyqtSignal(str)
+
+    def __init__(self, url: str, dest: str) -> None:
+        super().__init__()
+        self._url  = url
+        self._dest = dest
+
+    def run(self) -> None:
+        from mrs_protocol.self_update import download_update
+        try:
+            path = download_update(
+                self._url, Path(self._dest),
+                progress=lambda f, m: self.progress.emit(f, m),
+            )
+            self.finished.emit(str(path))
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 # ---------------------------------------------------------------------------
 # Logging bridge
 # ---------------------------------------------------------------------------
@@ -367,6 +390,9 @@ class MainWindow(QMainWindow):
         self._scan_thread:   Optional[QThread]        = None
         self._batch_listener: Optional[BatchListenerWorker] = None
         self._batch_thread:   Optional[QThread]             = None
+        self._update_dl_worker: Optional[_UpdateDownloadWorker] = None
+        self._update_dl_thread: Optional[QThread]               = None
+        self._pending_update:   Optional[dict]                  = None
         self._last_scan_label: str = ''   # carried into the flash event
         # Once the operator acknowledges the first "Flash complete" popup
         # this session, suppress it on every later flash so batch mode is
@@ -416,14 +442,31 @@ class MainWindow(QMainWindow):
         root.addLayout(help_row)
 
         # ── Update banner (hidden by default) ─────────────────────────
-        self._update_banner = QLabel()
-        self._update_banner.setStyleSheet(
-            'background: #fff3cd; color: #856404; padding: 8px; '
-            'border: 1px solid #ffc107; border-radius: 4px; font-size: 12px;'
+        # A message label plus a one-click "Update & Restart" button. The
+        # button downloads the new exe and swaps it in (see _on_update_clicked);
+        # the label doubles as a plain GitHub link if no installable asset was
+        # published, and as a live progress readout during the download.
+        self._update_bar = QWidget()
+        self._update_bar.setObjectName('updateBar')
+        self._update_bar.setStyleSheet(
+            '#updateBar { background: #fff3cd; border: 1px solid #ffc107; '
+            'border-radius: 4px; }'
+            '#updateBar QLabel { color: #856404; font-size: 12px; }'
+            '#updateBar QPushButton { background: #2a8; color: white; border: none; '
+            'padding: 5px 14px; border-radius: 4px; font-weight: bold; }'
+            '#updateBar QPushButton:hover { background: #2b9; }'
+            '#updateBar QPushButton:disabled { background: #9c9; }'
         )
+        _update_row = QHBoxLayout(self._update_bar)
+        _update_row.setContentsMargins(8, 6, 8, 6)
+        self._update_banner = QLabel()
         self._update_banner.setOpenExternalLinks(True)
-        self._update_banner.setVisible(False)
-        root.addWidget(self._update_banner)
+        _update_row.addWidget(self._update_banner, 1)
+        self._update_btn = QPushButton('Update && Restart')
+        self._update_btn.clicked.connect(self._on_update_clicked)
+        _update_row.addWidget(self._update_btn)
+        self._update_bar.setVisible(False)
+        root.addWidget(self._update_bar)
 
         # ── Connection ────────────────────────────────────────────────
         conn_box = QGroupBox('PCAN Adapter')
@@ -667,20 +710,90 @@ class MainWindow(QMainWindow):
         self._update_thread.quit()
         if info.get('error'):
             return  # silently ignore — don't bother the user
-        if info.get('update_available'):
-            version = info['latest_version']
-            url = info.get('download_url', '')
-            if url:
-                self._update_banner.setText(
-                    f'New version <b>{version}</b> available! '
-                    f'<a href="{url}">Download update</a>'
-                )
-            else:
-                self._update_banner.setText(
-                    f'New version <b>{version}</b> available on GitHub.'
-                )
-            self._update_banner.setVisible(True)
-            self._append_log(f'Update available: {version}')
+        if not info.get('update_available'):
+            return
+
+        self._pending_update = info
+        version = info['latest_version']
+        url = info.get('download_url', '')
+        if url:
+            # One-click self-install path.
+            self._update_banner.setText(f'New version <b>{version}</b> available.')
+            self._update_btn.setVisible(True)
+            self._update_btn.setEnabled(True)
+        else:
+            # No installable .exe asset — fall back to the GitHub link.
+            self._update_banner.setText(
+                f'New version <b>{version}</b> available on '
+                f'<a href="https://github.com/S0lsem/StyrestromProgrammer/releases/latest">GitHub</a>.'
+            )
+            self._update_btn.setVisible(False)
+        self._update_bar.setVisible(True)
+        self._append_log(f'Update available: {version}')
+
+    def _on_update_clicked(self) -> None:
+        """Download the new exe and, once it's on disk, swap it in and restart."""
+        info = self._pending_update or {}
+        url = info.get('download_url', '')
+        if not url:
+            return
+
+        from mrs_protocol import self_update
+        if not self_update.is_frozen():
+            QMessageBox.information(
+                self, 'Update',
+                'Self-install runs only in the packaged .exe.\n\n'
+                'In this dev build, download the release manually from GitHub.',
+            )
+            return
+
+        version = info.get('latest_version', '')
+        if QMessageBox.question(
+            self, 'Update & Restart',
+            f'Download version {version} and restart the programmer now?\n\n'
+            'Finish any flash in progress first — the app will close.',
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        # A flash or scan holds exclusive PCAN access; make sure nothing is
+        # mid-operation before we tear the process down.
+        self._stop_batch_listener()
+
+        self._update_btn.setEnabled(False)
+        self._update_banner.setText('Downloading update…')
+
+        dest = str(self_update.default_download_path())
+        self._update_dl_worker = _UpdateDownloadWorker(url, dest)
+        self._update_dl_thread = QThread(self)
+        self._update_dl_worker.moveToThread(self._update_dl_thread)
+        self._update_dl_thread.started.connect(self._update_dl_worker.run)
+        self._update_dl_worker.progress.connect(self._on_update_progress)
+        self._update_dl_worker.finished.connect(self._on_update_downloaded)
+        self._update_dl_worker.error.connect(self._on_update_error)
+        self._update_dl_worker.finished.connect(self._update_dl_thread.quit)
+        self._update_dl_worker.error.connect(self._update_dl_thread.quit)
+        self._update_dl_thread.start()
+
+    def _on_update_progress(self, fraction: float, message: str) -> None:
+        self._update_banner.setText(f'{message} {int(fraction * 100)}%')
+
+    def _on_update_downloaded(self, path: str) -> None:
+        from mrs_protocol import self_update
+        self._update_banner.setText('Update downloaded — restarting…')
+        self._append_log(f'Update downloaded to {path}; restarting.')
+        try:
+            self_update.install_and_restart(Path(path))
+        except Exception as exc:
+            self._on_update_error(str(exc))
+            return
+        # The helper waits for us to exit before swapping the exe, so quit now.
+        QApplication.instance().quit()
+
+    def _on_update_error(self, msg: str) -> None:
+        self._update_banner.setText('Update failed — see log.')
+        self._update_btn.setEnabled(True)
+        self._append_log(f'Update failed: {msg}')
+        QMessageBox.warning(self, 'Update failed', msg)
 
     # ------------------------------------------------------------------
     # Adapter connection check
