@@ -687,6 +687,9 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_check_connection(self) -> None:
+        # Probing PCAN channels while the batch listener holds one makes that
+        # channel look busy; release it first (resumed in _on_conn_result).
+        self._stop_batch_listener()
         self._check_conn_btn.setEnabled(False)
         self._conn_status.setText('  Scanning…')
         self._conn_status.setStyleSheet('color: #888; font-weight: bold;')
@@ -714,6 +717,10 @@ class MainWindow(QMainWindow):
             self._conn_status.setText('  Not connected')
             self._conn_status.setStyleSheet('color: #c22; font-weight: bold;')
             self._append_log(f'PCAN adapter not found: {msg}')
+
+        # Resume batch listening if it was on (detect_adapter has released all
+        # probed channels by now, so the listener can reclaim its channel).
+        self._maybe_start_batch_listener()
 
     # ------------------------------------------------------------------
     # GitHub download
@@ -923,9 +930,20 @@ class MainWindow(QMainWindow):
     def _on_flash_thread_finished(self) -> None:
         """Drop Python refs once the flash thread has fully exited.
         Mirrors _on_batch_thread_finished — without it, ~20 rapid batch
-        flashes accumulate stale wrapper state and eventually crash Qt."""
+        flashes accumulate stale wrapper state and eventually crash Qt.
+
+        This is also where batch mode resumes. The listener needs exclusive
+        PCAN access, so _maybe_start_batch_listener() refuses to start while
+        the flash thread is still running. _on_flash_done() runs too early
+        for that — it fires before _flash_thread.quit() is processed, so the
+        guard sees the thread still alive and bails. (That's why batch
+        auto-flash used to work exactly once: the first flash's completion
+        popup pumped a nested event loop that let the thread finish before
+        the restart, accidentally masking the bug.) Restarting here — after
+        the thread has genuinely exited and refs are cleared — is reliable."""
         self._flash_worker = None
         self._flash_thread = None
+        self._maybe_start_batch_listener()
 
     def _on_flash(self) -> None:
         if self._firmware is None:
@@ -1079,14 +1097,15 @@ class MainWindow(QMainWindow):
                     save_report(report, directory=Path(path).parent)
                     self._append_log(f'Report saved to {path}')
 
-        # Batch mode: keep firmware loaded, or clear it
+        # Batch mode: keep firmware loaded, or clear it. When firmware stays
+        # loaded, the batch listener is (re)started from
+        # _on_flash_thread_finished once the flash thread has actually exited
+        # — not here, where the thread is still running and the restart guard
+        # would bail.
         if not self._batch_check.isChecked():
             self._firmware = None
             self._loaded_part_name = ''
             self._refresh_firmware_label()
-        else:
-            # Firmware stayed loaded → start listening for the next PLC.
-            self._maybe_start_batch_listener()
 
     def _on_flash_error(self, tb: str) -> None:
         self._flash_btn.setEnabled(True)
@@ -1119,10 +1138,10 @@ class MainWindow(QMainWindow):
 
         QMessageBox.critical(self, 'Flash failed', 'An error occurred:\n\n' + tb[:500])
 
-        # If batch mode is still on and firmware is still loaded, keep
-        # listening for the next PLC — a single bad unit should not abort
-        # an in-progress batch run.
-        self._maybe_start_batch_listener()
+        # A single bad unit should not abort an in-progress batch run — the
+        # batch listener is restarted from _on_flash_thread_finished once the
+        # flash thread has exited, so batch mode keeps listening for the next
+        # PLC after a failure too.
 
     def _post_flash_event(
         self,
@@ -1182,6 +1201,12 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # Scan opens the PCAN bus directly, so it needs exclusive access —
+        # the batch listener holds the same channel and would otherwise cause
+        # "A PCAN Channel has not been initialized yet" on can.Bus(). Release
+        # it here; it's restarted from _on_scan_thread_finished afterwards.
+        self._stop_batch_listener()
+
         module_name = self._module_combo.currentText()
         cfg         = MODULE_TYPES[module_name]
 
@@ -1208,9 +1233,22 @@ class MainWindow(QMainWindow):
         self._scan_worker.error.connect(self._on_scan_error)
         self._scan_worker.result.connect(self._scan_thread.quit)
         self._scan_worker.error.connect(self._scan_thread.quit)
+        # Clear refs and resume batch listening only once the scan thread has
+        # actually exited (its bus is shut down) — mirrors the flash-thread
+        # pattern so a Scan during batch mode doesn't kill the auto-flash loop.
+        self._scan_thread.finished.connect(self._on_scan_thread_finished)
+        self._scan_worker.result.connect(self._scan_worker.deleteLater)
+        self._scan_worker.error.connect(self._scan_worker.deleteLater)
         self._scan_thread.finished.connect(self._scan_thread.deleteLater)
 
         self._scan_thread.start()
+
+    def _on_scan_thread_finished(self) -> None:
+        """Drop scan refs once the scan thread has exited, then resume batch
+        mode if it's still enabled (no-op otherwise)."""
+        self._scan_worker = None
+        self._scan_thread = None
+        self._maybe_start_batch_listener()
 
     def _on_scan_done(self, info) -> None:
         self._scan_btn.setEnabled(True)
