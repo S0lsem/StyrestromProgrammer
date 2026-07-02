@@ -13,6 +13,8 @@ import pytest
 from mrs_protocol.trc_parser import TrcParser, TrcMessage
 from mrs_protocol import firmware_cache
 from mrs_protocol.s19_parser import parse_s19, S19ParseError
+from mrs_protocol import protocol
+from mrs_protocol.protocol import scan_plc, ScanError, PartialScanError, CAN_ID_PLC_BOOT
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +94,75 @@ class TestS19Parser:
     def test_malformed_line_raises(self):
         with pytest.raises(S19ParseError):
             parse_s19('this is not an s-record\n')
+
+
+# ---------------------------------------------------------------------------
+# TestScan — boot announcement handling and the CAN FD partial-scan path
+# ---------------------------------------------------------------------------
+
+
+class _FakeMsg:
+    def __init__(self, arb_id: int, data: bytes) -> None:
+        self.arbitration_id = arb_id
+        self.data = data
+
+
+class _FakeBus:
+    """A minimal stand-in for ``can.Bus``.
+
+    Hands out ``boot_count`` copies of the boot announcement, then returns
+    ``None`` forever — i.e. the module announces itself but never answers the
+    handshake on 0x1FFFFFF2. That is exactly the CAN FD signature seen in the
+    field: classical boot frame gets through, FD handshake reply does not.
+    """
+    def __init__(self, announcement: bytes, boot_count: int) -> None:
+        self._ann = announcement
+        self._boot_left = boot_count
+        self.shutdown_called = False
+
+    def recv(self, timeout: float = 0):
+        if self._boot_left > 0:
+            self._boot_left -= 1
+            return _FakeMsg(CAN_ID_PLC_BOOT, self._ann)
+        return None
+
+    def send(self, msg) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
+
+
+class TestScan:
+    # The real boot announcement captured from a 1494X_32BIT_CANFD_RELAY:
+    # serial = (0x51 << 16) | (0xE6 << 8) | 0x19 = 5_367_321.
+    _CANFD_ANNOUNCE = bytes([0x11, 0xCD, 0x51, 0xE6, 0x19, 0x00, 0x00, 0x25])
+
+    def _patch_bus(self, monkeypatch, bus):
+        import can
+        monkeypatch.setattr(can, 'Bus', lambda **kwargs: bus)
+
+    def test_boot_seen_but_no_handshake_is_partial(self, monkeypatch):
+        """Boot announcement arrives, handshake never answered → PartialScanError
+        carrying the recovered serial (not a hard ScanError)."""
+        bus = _FakeBus(self._CANFD_ANNOUNCE, boot_count=3)
+        self._patch_bus(monkeypatch, bus)
+
+        with pytest.raises(PartialScanError) as excinfo:
+            scan_plc('PCAN_USBBUS1', 125000)
+
+        assert excinfo.value.serial == 5_367_321
+        assert bus.shutdown_called          # bus is always cleaned up
+
+    def test_no_announcement_is_hard_error(self, monkeypatch):
+        """A silent bus (no PLC) still raises a plain ScanError, never the
+        partial variant — we must not tell the operator to 'just flash'."""
+        bus = _FakeBus(self._CANFD_ANNOUNCE, boot_count=0)
+        self._patch_bus(monkeypatch, bus)
+
+        with pytest.raises(ScanError) as excinfo:
+            scan_plc('PCAN_USBBUS1', 125000, timeout=0.05)
+        assert not isinstance(excinfo.value, PartialScanError)
 
 
 # ---------------------------------------------------------------------------

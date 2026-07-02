@@ -1,5 +1,7 @@
 # Token / secrets — never commit this
 mrs_protocol/config.py
+# GitHub token used by release.ps1 to publish releases — never commit this
+.github_token
 
 # Python
 __pycache__/

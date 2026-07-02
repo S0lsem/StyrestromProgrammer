@@ -86,7 +86,7 @@ def _format_sw(text: str) -> str:
     return f'SW: {num}' if num else ''
 from mrs_protocol.constants import MODULE_TYPES
 from mrs_protocol.console_flasher import run_flash
-from mrs_protocol.protocol import detect_adapter, scan_plc, ScanError
+from mrs_protocol.protocol import detect_adapter, scan_plc, ScanError, PartialScanError
 from mrs_protocol.s19_parser import Firmware
 from mrs_protocol.version import APP_VERSION
 
@@ -244,8 +244,9 @@ class _IdentityDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 class ScanWorker(QObject):
-    result = pyqtSignal(object)   # PLCInfo
-    error  = pyqtSignal(str)
+    result  = pyqtSignal(object)   # PLCInfo
+    partial = pyqtSignal(int, str) # (serial, friendly message) — detected, identity unreadable (CAN FD)
+    error   = pyqtSignal(str)
 
     def __init__(
         self,
@@ -266,6 +267,8 @@ class ScanWorker(QObject):
                 self._channel, self._bitrate, self._is_can_fd, self._data_bitrate
             )
             self.result.emit(info)
+        except PartialScanError as exc:
+            self.partial.emit(exc.serial, str(exc))
         except ScanError as exc:
             self.error.emit(str(exc))
         except Exception as exc:
@@ -1343,14 +1346,17 @@ class MainWindow(QMainWindow):
 
         self._scan_thread.started.connect(self._scan_worker.run)
         self._scan_worker.result.connect(self._on_scan_done)
+        self._scan_worker.partial.connect(self._on_scan_partial)
         self._scan_worker.error.connect(self._on_scan_error)
         self._scan_worker.result.connect(self._scan_thread.quit)
+        self._scan_worker.partial.connect(self._scan_thread.quit)
         self._scan_worker.error.connect(self._scan_thread.quit)
         # Clear refs and resume batch listening only once the scan thread has
         # actually exited (its bus is shut down) — mirrors the flash-thread
         # pattern so a Scan during batch mode doesn't kill the auto-flash loop.
         self._scan_thread.finished.connect(self._on_scan_thread_finished)
         self._scan_worker.result.connect(self._scan_worker.deleteLater)
+        self._scan_worker.partial.connect(self._scan_worker.deleteLater)
         self._scan_worker.error.connect(self._scan_worker.deleteLater)
         self._scan_thread.finished.connect(self._scan_thread.deleteLater)
 
@@ -1387,6 +1393,21 @@ class MainWindow(QMainWindow):
         if info.description:
             self._append_log(f'  Description: {info.description}')
         self._append_log('Power-cycle the PLC again before clicking Flash.')
+
+    def _on_scan_partial(self, serial: int, msg: str) -> None:
+        """The PLC was detected but its identity couldn't be read (CAN FD).
+        Not a failure — the unit is present and flashable, so we present this
+        as an informational outcome and keep Flash ready to go."""
+        self._scan_btn.setEnabled(True)
+        self._check_conn_btn.setEnabled(True)
+        self._flash_btn.setEnabled(True)
+        self._status_label.setText(f'PLC detected — SN {serial} (CAN FD — press Flash)')
+        self._append_log(f'PLC DETECTED — SN: {serial}')
+        self._append_log(
+            '  Full identity not readable (CAN FD module). This is expected — '
+            'just press Flash; no Scan is needed for these parts.'
+        )
+        QMessageBox.information(self, 'PLC detected — ready to flash', msg)
 
     def _on_scan_error(self, msg: str) -> None:
         self._scan_btn.setEnabled(True)

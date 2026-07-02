@@ -63,6 +63,22 @@ class ScanError(Exception):
     """Raised when SCAN can't reach the PLC or the PLC responds unexpectedly."""
 
 
+class PartialScanError(ScanError):
+    """The PLC *was* detected — its boot announcement arrived and we read its
+    serial — but the identity read did not complete.
+
+    This is the expected outcome for CAN FD modules: their bootloader answers
+    the handshake in a CAN FD dialect our classical-CAN scan can't read, so
+    the handshake/memory read times out even though the module is present and
+    healthy. Such modules flash normally via the console flasher — Scan is only
+    an optional pre-flight. Carries the serial recovered from the boot
+    announcement so the UI can still show which unit was seen.
+    """
+    def __init__(self, serial: int, message: str) -> None:
+        super().__init__(message)
+        self.serial = serial
+
+
 # ---------------------------------------------------------------------------
 # Adapter detection
 # ---------------------------------------------------------------------------
@@ -151,13 +167,26 @@ def scan_plc(
         except ScanError:
             pass  # repeated announcement is best-effort
 
-        _handshake(bus, identity)
+        # From here on the PLC is confirmed present (we have its serial). A
+        # timeout now means the identity read didn't complete — expected for
+        # CAN FD modules — so surface it as a PartialScanError, not a hard
+        # failure, so the UI can say "detected, just flash it".
+        try:
+            _handshake(bus, identity)
 
-        info.article     = _read_string(bus, [(0x14, 8), (0x1C, 4)])
-        info.revision    = _read_string(bus, [(0x44, 2)])
-        info.description = _read_string(bus, [(0x20, 8), (0x28, 8), (0x30, 4)])
-        info.app_name    = _read_string(bus, [(0x7F, 8), (0x87, 8), (0x8F, 8), (0x97, 6)])
-        info.app_version = _read_string(bus, [(0x6B, 8), (0x73, 8), (0x7B, 4)])
+            info.article     = _read_string(bus, [(0x14, 8), (0x1C, 4)])
+            info.revision    = _read_string(bus, [(0x44, 2)])
+            info.description = _read_string(bus, [(0x20, 8), (0x28, 8), (0x30, 4)])
+            info.app_name    = _read_string(bus, [(0x7F, 8), (0x87, 8), (0x8F, 8), (0x97, 6)])
+            info.app_version = _read_string(bus, [(0x6B, 8), (0x73, 8), (0x7B, 4)])
+        except ScanError as exc:
+            raise PartialScanError(
+                info.serial,
+                f'PLC detected (SN {info.serial}), but its full identity could '
+                f'not be read. This is normal for CAN FD modules — they cannot '
+                f'be scanned, but they flash correctly. Just press Flash — no '
+                f'Scan is needed.',
+            ) from exc
 
         log.info(
             'PLC Info: SN=%d article=%s rev=%s app=%s ver=%s',
