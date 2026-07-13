@@ -89,6 +89,7 @@ from mrs_protocol.console_flasher import run_flash
 from mrs_protocol.protocol import detect_adapter, scan_plc, ScanError, PartialScanError
 from mrs_protocol.s19_parser import Firmware
 from mrs_protocol.version import APP_VERSION
+from mrs_protocol import auth
 
 
 # ---------------------------------------------------------------------------
@@ -166,9 +167,10 @@ class _CheckAdapterWorker(QObject):
 # ---------------------------------------------------------------------------
 
 class DownloadWorker(QObject):
-    progress = pyqtSignal(float, str)
-    finished = pyqtSignal(object)   # Firmware
-    error    = pyqtSignal(str)
+    progress      = pyqtSignal(float, str)
+    finished      = pyqtSignal(object)   # Firmware
+    error         = pyqtSignal(str)
+    auth_required = pyqtSignal()          # 401 — token missing/expired/revoked
 
     def __init__(self, part: str) -> None:
         super().__init__()
@@ -179,64 +181,116 @@ class DownloadWorker(QObject):
             from mrs_protocol.github_downloader import download_part
             firmware = download_part(self._part, self.progress.emit)
             self.finished.emit(firmware)
+        except auth.AuthenticationError:
+            self.auth_required.emit()
         except Exception as exc:
             self.error.emit(str(exc))
 
 
 # ---------------------------------------------------------------------------
-# Operator identity dialog — self-reported distributor + operator initials,
-# persisted via QSettings so HQ can attribute every flash event.
+# Login — authenticate the distributor account against the proxy /login.
+# The proxy will not serve firmware without a valid token, so this gates the
+# whole app. The account also supplies the log/event identity.
 # ---------------------------------------------------------------------------
 
-class _IdentityDialog(QDialog):
-    def __init__(self, parent, distributor: str, operator: str) -> None:
-        super().__init__(parent)
-        self.setWindowTitle('Operator identity')
-        self.setMinimumWidth(360)
+class _LoginWorker(QObject):
+    ok   = pyqtSignal(dict)   # server payload: token, expires_at, username, distributor
+    fail = pyqtSignal(str)
 
-        self._distributor_edit = QLineEdit(distributor)
-        self._distributor_edit.setPlaceholderText('e.g. Acme Norway AS')
-        self._operator_edit = QLineEdit(operator)
-        self._operator_edit.setPlaceholderText('e.g. EJS')
-        self._operator_edit.setMaxLength(16)
+    def __init__(self, username: str, password: str) -> None:
+        super().__init__()
+        self._username = username
+        self._password = password
+
+    def run(self) -> None:
+        from mrs_protocol.auth import login, LoginError
+        try:
+            self.ok.emit(login(self._username, self._password))
+        except LoginError as exc:
+            self.fail.emit(str(exc))
+        except Exception as exc:
+            self.fail.emit(f'Unexpected error: {exc}')
+
+
+class _LoginDialog(QDialog):
+    def __init__(self, parent, prefill_username: str = '', message: str = '') -> None:
+        super().__init__(parent)
+        self.setWindowTitle('Log in')
+        self.setMinimumWidth(360)
+        self._info = None
+        self._thread = None
+        self._worker = None
+
+        self._user_edit = QLineEdit(prefill_username)
+        self._user_edit.setPlaceholderText('username')
+        self._pass_edit = QLineEdit()
+        self._pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._pass_edit.setPlaceholderText('password')
+        self._pass_edit.returnPressed.connect(self._on_login)
 
         form = QFormLayout()
-        form.addRow('Distributor:', self._distributor_edit)
-        form.addRow('Operator initials:', self._operator_edit)
+        form.addRow('Username:', self._user_edit)
+        form.addRow('Password:', self._pass_edit)
 
-        info = QLabel(
-            'Every flash will be tagged with these so Styrestrøm HQ can '
-            'see which distributor / operator programmed each PLC.'
-        )
-        info.setWordWrap(True)
-        info.setStyleSheet('color: #555; font-size: 11px;')
+        self._status = QLabel(message or 'Log in with your distributor account.')
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet('color: #555; font-size: 11px;')
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        self._buttons = buttons
+        self._login_btn = QPushButton('Log in')
+        self._login_btn.setDefault(True)
+        self._login_btn.clicked.connect(self._on_login)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_row.addWidget(self._login_btn)
 
         root = QVBoxLayout(self)
         root.addLayout(form)
-        root.addWidget(info)
-        root.addWidget(buttons)
+        root.addWidget(self._status)
+        root.addLayout(btn_row)
 
-    def _on_accept(self) -> None:
-        if not self._distributor_edit.text().strip():
-            QMessageBox.warning(self, 'Required', 'Distributor name is required.')
+    def _on_login(self) -> None:
+        username = self._user_edit.text().strip()
+        password = self._pass_edit.text()
+        if not username or not password:
+            self._status.setText('Enter your username and password.')
             return
-        if not self._operator_edit.text().strip():
-            QMessageBox.warning(self, 'Required', 'Operator initials are required.')
-            return
+        self._set_busy(True)
+        self._status.setText('Logging in…')
+
+        self._worker = _LoginWorker(username, password)
+        self._thread = QThread(self)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.ok.connect(self._on_ok)
+        self._worker.fail.connect(self._on_fail)
+        self._thread.start()
+
+    def _finish_thread(self) -> None:
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait(2000)
+            self._thread = None
+            self._worker = None
+
+    def _on_ok(self, info: dict) -> None:
+        self._finish_thread()
+        self._info = info
         self.accept()
 
-    def values(self) -> tuple[str, str]:
-        return (
-            self._distributor_edit.text().strip(),
-            self._operator_edit.text().strip(),
-        )
+    def _on_fail(self, msg: str) -> None:
+        self._finish_thread()
+        self._set_busy(False)
+        self._status.setText(msg)
+        self._pass_edit.selectAll()
+        self._pass_edit.setFocus()
+
+    def _set_busy(self, busy: bool) -> None:
+        self._login_btn.setEnabled(not busy)
+        self._user_edit.setEnabled(not busy)
+        self._pass_edit.setEnabled(not busy)
+
+    def account_info(self) -> Optional[dict]:
+        return self._info
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +450,9 @@ class MainWindow(QMainWindow):
         self._update_dl_worker: Optional[_UpdateDownloadWorker] = None
         self._update_dl_thread: Optional[QThread]               = None
         self._pending_update:   Optional[dict]                  = None
+        self._login_ok:          bool = False   # main() checks this before showing
+        self._account_username:  str  = ''
+        self._account_distributor: str = ''
         self._last_scan_label: str = ''   # carried into the flash event
         # Once the operator acknowledges the first "Flash complete" popup
         # this session, suppress it on every later flash so batch mode is
@@ -413,8 +470,14 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_menu()
         self._setup_logging()
+
+        # Gate the app on login: the proxy won't serve firmware without a valid
+        # token. If the operator cancels, main() sees _login_ok False and exits.
+        self._login_ok = self._restore_or_login()
+        if not self._login_ok:
+            return
+
         self._check_for_updates()
-        self._ensure_identity()
         event_logger.replay_pending()
 
     # ------------------------------------------------------------------
@@ -666,9 +729,9 @@ class MainWindow(QMainWindow):
     def _build_menu(self) -> None:
         bar = self.menuBar()
         settings_menu = bar.addMenu('&Settings')
-        action = QAction('&Operator identity…', self)
-        action.triggered.connect(self._on_change_identity)
-        settings_menu.addAction(action)
+        logout_action = QAction('&Log out (switch account)…', self)
+        logout_action.triggered.connect(self._logout)
+        settings_menu.addAction(logout_action)
 
     def _distributor(self) -> str:
         return str(self._settings.value('distributor', '', type=str))
@@ -676,26 +739,72 @@ class MainWindow(QMainWindow):
     def _operator(self) -> str:
         return str(self._settings.value('operator', '', type=str))
 
-    def _ensure_identity(self) -> None:
-        """Prompt on first run; subsequent launches read from QSettings."""
-        if self._distributor() and self._operator():
-            return
-        self._prompt_identity(first_run=True)
+    # ------------------------------------------------------------------
+    # Login flow — the account gates the app and supplies the log identity
+    # ------------------------------------------------------------------
 
-    def _on_change_identity(self) -> None:
-        self._prompt_identity(first_run=False)
-
-    def _prompt_identity(self, first_run: bool) -> None:
-        dlg = _IdentityDialog(self, self._distributor(), self._operator())
-        if first_run:
-            dlg.setWindowTitle('Welcome — set your operator identity')
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            distributor, operator = dlg.values()
-            self._settings.setValue('distributor', distributor)
-            self._settings.setValue('operator', operator)
-            self._append_log(
-                f'Operator identity set: {operator} @ {distributor}'
+    def _restore_or_login(self) -> bool:
+        """Reuse a saved, unexpired token if present; otherwise prompt login.
+        Returns True once authenticated, False if the operator cancels."""
+        import time
+        token    = str(self._settings.value('auth_token', '', type=str))
+        expires  = int(self._settings.value('auth_expires', 0, type=int))
+        username = str(self._settings.value('auth_username', '', type=str))
+        # Small margin so we don't start a session that's about to expire.
+        if token and expires > int(time.time()) + 60:
+            auth.set_token(token)
+            self._account_username = username
+            self._account_distributor = str(
+                self._settings.value('auth_distributor', '', type=str)
             )
+            self._append_log(
+                f'Logged in as {username} @ {self._account_distributor}'
+            )
+            return True
+        return self._show_login()
+
+    def _show_login(self, message: str = '') -> bool:
+        prefill = str(self._settings.value('auth_username', '', type=str))
+        dlg = _LoginDialog(self, prefill_username=prefill, message=message)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        self._save_login(dlg.account_info() or {})
+        return True
+
+    def _save_login(self, info: dict) -> None:
+        token       = str(info.get('token', ''))
+        expires     = int(info.get('expires_at', 0))
+        username    = str(info.get('username', ''))
+        distributor = str(info.get('distributor', ''))
+        auth.set_token(token)
+        self._settings.setValue('auth_token', token)
+        self._settings.setValue('auth_expires', expires)
+        self._settings.setValue('auth_username', username)
+        self._settings.setValue('auth_distributor', distributor)
+        # Feed the existing flash-log / HQ-event identity from the account.
+        self._settings.setValue('distributor', distributor)
+        self._settings.setValue('operator', username)
+        self._account_username = username
+        self._account_distributor = distributor
+        self._append_log(f'Logged in as {username} @ {distributor}')
+
+    def _logout(self) -> None:
+        auth.clear_token()
+        self._settings.remove('auth_token')
+        self._settings.remove('auth_expires')
+        self._append_log('Logged out.')
+        if not self._show_login():
+            QApplication.instance().quit()
+
+    def _on_auth_required(self) -> None:
+        """A proxy request returned 401 — token expired or the account was
+        disabled. Drop the token and prompt for login again."""
+        auth.clear_token()
+        self._settings.remove('auth_token')
+        self._settings.remove('auth_expires')
+        self._append_log('Session expired or access revoked — please log in again.')
+        if not self._show_login(message='Your session expired. Please log in again.'):
+            QApplication.instance().quit()
 
     # ------------------------------------------------------------------
     # Update check (runs on startup, background thread)
@@ -860,6 +969,7 @@ class MainWindow(QMainWindow):
         self._parts_worker.error.connect(
             lambda msg: self._on_parts_error(msg)
         )
+        self._parts_worker.auth_required.connect(self._on_parts_auth_required)
         self._parts_thread.start()
 
     def _on_parts_loaded(self, parts: list[str]) -> None:
@@ -878,6 +988,12 @@ class MainWindow(QMainWindow):
         self._status_label.setText('Error fetching parts — see log')
         self._append_log(f'GitHub error: {msg}')
         QMessageBox.warning(self, 'GitHub error', msg)
+
+    def _on_parts_auth_required(self) -> None:
+        self._parts_thread.quit()
+        self._refresh_btn.setEnabled(True)
+        self._status_label.setText('Please log in')
+        self._on_auth_required()
 
     def _on_download_part(self) -> None:
         part = self._part_combo.currentText()
@@ -902,8 +1018,10 @@ class MainWindow(QMainWindow):
         self._dl_worker.progress.connect(self._on_dl_progress)
         self._dl_worker.finished.connect(self._on_dl_done)
         self._dl_worker.error.connect(self._on_dl_error)
+        self._dl_worker.auth_required.connect(self._on_dl_auth_required)
         self._dl_worker.finished.connect(self._dl_thread.quit)
         self._dl_worker.error.connect(self._dl_thread.quit)
+        self._dl_worker.auth_required.connect(self._dl_thread.quit)
         self._dl_thread.finished.connect(self._dl_thread.deleteLater)
 
         self._dl_thread.start()
@@ -937,6 +1055,13 @@ class MainWindow(QMainWindow):
         self._status_label.setText('Download failed — see log')
         self._append_log(f'Download error: {msg}')
         QMessageBox.critical(self, 'Download failed', msg)
+
+    def _on_dl_auth_required(self) -> None:
+        self._refresh_firmware_label()
+        self._download_btn.setEnabled(True)
+        self._refresh_btn.setEnabled(True)
+        self._status_label.setText('Please log in')
+        self._on_auth_required()
 
     # ------------------------------------------------------------------
     # Flash
@@ -1274,8 +1399,8 @@ class MainWindow(QMainWindow):
         operator    = self._operator()
         if not distributor or not operator:
             self._append_log(
-                'Event NOT reported — operator identity is unset. '
-                'Open Settings → Operator identity… to fix.'
+                'Event NOT reported — account identity is unset. '
+                'Use Settings → Log out and log in again to fix.'
             )
             return
 
@@ -1444,13 +1569,16 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 class _ListPartsWorker(QObject):
-    finished = pyqtSignal(list)
-    error    = pyqtSignal(str)
+    finished      = pyqtSignal(list)
+    error         = pyqtSignal(str)
+    auth_required = pyqtSignal()          # 401 — token missing/expired/revoked
 
     def run(self) -> None:
         try:
             from mrs_protocol.github_downloader import list_parts
             self.finished.emit(list_parts())
+        except auth.AuthenticationError:
+            self.auth_required.emit()
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -1463,6 +1591,9 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     win = MainWindow()
+    if not win._login_ok:
+        # Operator cancelled the login gate — nothing to show.
+        return
     win.show()
     sys.exit(app.exec())
 

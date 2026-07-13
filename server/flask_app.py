@@ -22,9 +22,24 @@ Setup on PythonAnywhere:
   7. Go to "Web" tab → click "Reload"
   8. Set environment variables (see below)
 
+This file needs two companions in the same folder (upload all three):
+  user_store.py    ← password hashing + login-token signing (no dependencies)
+  manage_users.py  ← CLI to create / disable distributor accounts
+
 Environment variables (set in your WSGI file or in a .env file):
   GITHUB_TOKEN        = your fine-grained PAT (read-only, Contents permission)
-  PROXY_API_KEY       = a random secret string (the app uses this to authenticate)
+  PROXY_API_KEY       = a random secret string (legacy app-level key)
+  TOKEN_SECRET        = a long random string used to sign login tokens. REQUIRED
+                        for logins to work. Keep it secret; changing it logs
+                        everyone out.
+  LOGIN_ENFORCED      = '1' (default) requires a valid login for firmware.
+                        Set '0' during rollout so old (pre-login) apps keep
+                        working via PROXY_API_KEY; flip to '1' once everyone
+                        has updated to the login-enabled app.
+  TOKEN_TTL_SECONDS   = how long a login lasts (default 2592000 = 30 days).
+  USERS_FILE          = path to users.json (default: next to these files).
+
+Accounts are created with:  python manage_users.py add <username> "<Distributor>"
 
 Expected repo layout (private GitHub repo, owner/name set below):
   mrs-firmware/
@@ -44,6 +59,8 @@ from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, request, abort, Response
 
+import user_store
+
 app = Flask(__name__)
 
 # ---------- Configuration ----------
@@ -52,6 +69,14 @@ PROXY_API_KEY = os.environ.get('PROXY_API_KEY', '')
 GITHUB_OWNER = 'S0lsem'
 GITHUB_REPO = 'Code-for-Highbeam-X'
 FIRMWARE_PATH = 'mrs-firmware'
+
+# ---------- Login / access control ----------
+TOKEN_SECRET      = os.environ.get('TOKEN_SECRET', '')
+TOKEN_TTL_SECONDS = int(os.environ.get('TOKEN_TTL_SECONDS', 30 * 24 * 3600))
+# Default: enforce login. Set LOGIN_ENFORCED=0 during rollout to also accept the
+# legacy PROXY_API_KEY so pre-login apps keep working until everyone updates.
+LOGIN_ENFORCED = os.environ.get('LOGIN_ENFORCED', '1').strip().lower() \
+    not in ('0', 'false', 'no', '')
 
 _API = 'https://api.github.com'
 
@@ -62,6 +87,36 @@ def _check_api_key():
         return
     if key != PROXY_API_KEY:
         abort(403, 'Invalid API key')
+
+
+def _bearer_token() -> str:
+    auth = request.headers.get('Authorization', '')
+    if auth.startswith('Bearer '):
+        return auth[len('Bearer '):].strip()
+    return ''
+
+
+def _require_auth() -> str:
+    """Authorize a firmware request. Returns the username (or '' for a legacy
+    key match). Aborts 401/403 if the caller isn't allowed.
+
+    A valid login token wins. When LOGIN_ENFORCED is off, a request with no
+    token falls back to the legacy PROXY_API_KEY check so old apps keep working
+    during the rollout window.
+    """
+    token = _bearer_token()
+    if token:
+        username = user_store.verify_token(token, TOKEN_SECRET)
+        if username:
+            user = user_store.get_user(username)
+            if user and user.get('active', False):
+                return username
+        abort(401, 'Login expired or revoked. Please log in again.')
+
+    if not LOGIN_ENFORCED:
+        _check_api_key()   # legacy migration path
+        return ''
+    abort(401, 'Login required.')
 
 
 def _github_get(path: str):
@@ -95,9 +150,42 @@ def _find_s19(part: str) -> tuple[str, str] | None:
     return None
 
 
+@app.route('/login', methods=['POST'])
+def login():
+    """Validate username + password, return a signed login token.
+
+    Request JSON:  {"username": "...", "password": "..."}
+    Response JSON: {"token", "expires_at", "username", "distributor"}
+    """
+    if not TOKEN_SECRET:
+        abort(500, 'Server login is not configured (TOKEN_SECRET is unset).')
+
+    data = request.get_json(silent=True) or {}
+    username = str(data.get('username', '')).strip().lower()
+    password = str(data.get('password', ''))
+
+    user = user_store.get_user(username)
+    ok = (
+        user is not None
+        and user.get('active', False)
+        and user_store.verify_password(password, user.get('pw', ''))
+    )
+    if not ok:
+        # Uniform message — don't reveal whether the user exists or is disabled.
+        abort(401, 'Invalid username or password.')
+
+    token, exp = user_store.make_token(username, TOKEN_SECRET, TOKEN_TTL_SECONDS)
+    return jsonify({
+        'token':       token,
+        'expires_at':  exp,
+        'username':    username,
+        'distributor': user.get('distributor', ''),
+    })
+
+
 @app.route('/parts', methods=['GET'])
 def list_parts():
-    _check_api_key()
+    _require_auth()
     try:
         items = _github_get(FIRMWARE_PATH)
         parts = sorted(
@@ -120,7 +208,7 @@ def get_firmware(part: str):
     .s19 found. Any filename works, so the file can be uploaded straight
     out of MRS's bin/ folder without renaming.
     """
-    _check_api_key()
+    _require_auth()
     try:
         located = _find_s19(part)
         if located is None:

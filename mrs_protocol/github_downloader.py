@@ -19,8 +19,12 @@ from .s19_parser import Firmware, parse_s19
 def _proxy_request(endpoint: str) -> tuple[int, bytes, str]:
     """Send a GET to the proxy. Returns (status, body, content_type)."""
     from .config import PROXY_URL, PROXY_API_KEY
+    from .auth import get_token, AuthenticationError
     url = f'{PROXY_URL.rstrip("/")}/{endpoint.lstrip("/")}'
     headers = {'Accept': '*/*'}
+    token = get_token()
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
     if PROXY_API_KEY:
         headers['X-Api-Key'] = PROXY_API_KEY
     req = Request(url, headers=headers)
@@ -28,6 +32,10 @@ def _proxy_request(endpoint: str) -> tuple[int, bytes, str]:
         with urlopen(req, timeout=30) as resp:
             return resp.status, resp.read(), resp.headers.get_content_type()
     except HTTPError as exc:
+        if exc.code == 401:
+            raise AuthenticationError(
+                'Login required or expired. Please log in again.'
+            ) from exc
         if exc.code == 403:
             raise PermissionError(
                 'Access denied by proxy server. Check PROXY_API_KEY in config.py.'
