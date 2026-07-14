@@ -31,7 +31,12 @@ param(
     [string]$Notes = ''
 )
 
-$ErrorActionPreference = 'Stop'
+# NOTE: deliberately NOT 'Stop'. Under Windows PowerShell 5.1, 'Stop' turns a
+# native command's stderr *warning* (e.g. git's harmless "LF will be replaced
+# by CRLF") into a terminating error. We guard the steps that matter with
+# explicit $LASTEXITCODE checks instead; failed Invoke-RestMethod calls still
+# throw (HTTP errors are terminating regardless of this setting).
+$ErrorActionPreference = 'Continue'
 Set-Location $PSScriptRoot
 
 $RepoOwner = 'S0lsem'
