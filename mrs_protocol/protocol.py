@@ -134,18 +134,23 @@ def scan_plc(
     before the console flasher can take over.
 
     Raises ScanError on timeout or malformed response.
+
+    Note: the ``bitrate`` / ``is_can_fd`` / ``data_bitrate`` arguments are
+    accepted for signature stability but intentionally ignored — the MRS
+    bootloader ALWAYS announces in classical CAN at 125 kbit/s, even on CAN FD
+    modules (the app baud only applies once the module's firmware is running).
+    Opening the bus in FD mode here would both miss the boot announcement and
+    make the PCAN driver reject the plain bitrate settings
+    ("A parameter contains an invalid value"), so Scan is hard-wired to
+    classical 125 kbit/s.
     """
     import can
-    kwargs = {
-        'interface': 'pcan',
-        'channel':   channel,
-        'bitrate':   bitrate,
-        'fd':        is_can_fd,
-    }
-    if is_can_fd and data_bitrate:
-        kwargs['data_bitrate'] = data_bitrate
-
-    bus = can.Bus(**kwargs)
+    bus = can.Bus(
+        interface='pcan',
+        channel=channel,
+        bitrate=125000,
+        fd=False,
+    )
     try:
         info = PLCInfo()
 
