@@ -388,15 +388,28 @@ class BatchListenerWorker(QObject):
 # Flash worker — runs the CAN flash sequence in a QThread
 # ---------------------------------------------------------------------------
 
+# How many scan passes the flasher makes before giving up. A blank module is
+# caught on pass 1; a programmed module only sits in the bootloader for a few
+# ms per power-up, so reflashing it needs many passes while the operator
+# repeatedly power-cycles it. The operator can Stop early at any time.
+REFLASH_RETRIES = 40
+
+
 class FlashWorker(QObject):
     progress   = pyqtSignal(float, str)
     plc_found  = pyqtSignal(object)   # SimpleNamespace(serial=str, label=str)
     finished   = pyqtSignal()
     error      = pyqtSignal(str)
+    cancelled  = pyqtSignal()
 
-    def __init__(self, firmware: Firmware) -> None:
+    def __init__(self, firmware: Firmware, retries: int = 1) -> None:
         super().__init__()
         self._firmware = firmware
+        self._retries  = retries
+        self._cancel   = False
+
+    def cancel(self) -> None:
+        self._cancel = True
 
     def run(self) -> None:
         try:
@@ -407,8 +420,13 @@ class FlashWorker(QObject):
                 self._firmware,
                 progress=self.progress.emit,
                 plc_found=_on_plc,
+                cancel_check=lambda: self._cancel,
+                retries=self._retries,
             )
 
+            if self._cancel:
+                self.cancelled.emit()
+                return
             if result.success:
                 self.finished.emit()
                 return
@@ -443,6 +461,8 @@ class MainWindow(QMainWindow):
         self._dl_thread:     Optional[QThread]        = None
         self._flash_worker:  Optional[FlashWorker]    = None
         self._flash_thread:  Optional[QThread]        = None
+        self._flashing:      bool = False   # True while a flash/reflash loop runs
+        self._flash_prev_btn_text: str = ''
         self._scan_worker:   Optional[ScanWorker]     = None
         self._scan_thread:   Optional[QThread]        = None
         self._batch_listener: Optional[BatchListenerWorker] = None
@@ -1187,6 +1207,15 @@ class MainWindow(QMainWindow):
         self._maybe_start_batch_listener()
 
     def _on_flash(self) -> None:
+        # While a flash/reflash loop is running, this button acts as Stop.
+        if self._flashing:
+            if self._flash_worker is not None:
+                self._flash_worker.cancel()
+            self._flash_btn.setEnabled(False)
+            self._status_label.setText('Stopping…')
+            self._append_log('Stop requested — finishing current attempt…')
+            return
+
         if self._firmware is None:
             QMessageBox.warning(
                 self, 'No firmware',
@@ -1210,14 +1239,19 @@ class MainWindow(QMainWindow):
         firmware     = self._firmware
 
         self._last_plc_info = None
-        self._flash_btn.setEnabled(False)
+        self._flashing = True
+        self._flash_prev_btn_text = self._flash_btn.text()
+        self._flash_btn.setText('■ Stop')     # stays enabled so the loop is cancellable
         self._download_btn.setEnabled(False)
         self._progress_bar.setValue(0)
         self._status_label.setText('Starter flasher…')
         self._append_log(f'Starting flash — module: {module_name}  channel: {channel}')
-        self._append_log('Console flasher will detect the PLC; power-cycle it if needed.')
+        self._append_log(
+            'Flasher will keep scanning — power-cycle the PLC (repeatedly for an '
+            'already-programmed module) until it is caught. Click Stop to abort.'
+        )
 
-        self._flash_worker = FlashWorker(firmware)
+        self._flash_worker = FlashWorker(firmware, retries=REFLASH_RETRIES)
         self._flash_thread = QThread()
         self._flash_worker.moveToThread(self._flash_thread)
 
@@ -1226,8 +1260,10 @@ class MainWindow(QMainWindow):
         self._flash_worker.plc_found.connect(self._on_plc_found)
         self._flash_worker.finished.connect(self._on_flash_done)
         self._flash_worker.error.connect(self._on_flash_error)
+        self._flash_worker.cancelled.connect(self._on_flash_cancelled)
         self._flash_worker.finished.connect(self._flash_thread.quit)
         self._flash_worker.error.connect(self._flash_thread.quit)
+        self._flash_worker.cancelled.connect(self._flash_thread.quit)
         # Qt-managed cleanup so batch programming doesn't race the Python
         # GC after ~20 rapid flashes. Same pattern as BatchListenerWorker:
         # clear Python refs first (so any subsequent isRunning() check on
@@ -1257,8 +1293,22 @@ class MainWindow(QMainWindow):
             label += f'  {sw_display}'
         self._status_label.setText(label)
 
-    def _on_flash_done(self) -> None:
+    def _reset_flash_button(self) -> None:
+        """Restore the Flash button after a flash/reflash loop ends."""
+        self._flashing = False
+        if self._flash_prev_btn_text:
+            self._flash_btn.setText(self._flash_prev_btn_text)
         self._flash_btn.setEnabled(True)
+
+    def _on_flash_cancelled(self) -> None:
+        self._reset_flash_button()
+        self._download_btn.setEnabled(True)
+        self._progress_bar.setValue(0)
+        self._status_label.setText('Flash stopped')
+        self._append_log('Flash stopped by operator.')
+
+    def _on_flash_done(self) -> None:
+        self._reset_flash_button()
         self._download_btn.setEnabled(True)
         self._progress_bar.setValue(100)
         self._status_label.setText('Flash complete!')
@@ -1349,7 +1399,7 @@ class MainWindow(QMainWindow):
             self._refresh_firmware_label()
 
     def _on_flash_error(self, tb: str) -> None:
-        self._flash_btn.setEnabled(True)
+        self._reset_flash_button()
         self._download_btn.setEnabled(True)
         self._status_label.setText('Error — see log')
         self._append_log('ERROR:\n' + tb)

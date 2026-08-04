@@ -141,8 +141,9 @@ def run_flash(
     cancel_check: Callable[[], bool]           = lambda: False,
     flasher_exe:  Optional[Path]               = None,
     extra_args:   tuple                        = (),
+    retries:      int                          = 1,
 ) -> FlashResult:
-    """Run one flash via the MRS console flasher.
+    """Run a flash via the MRS console flasher, retrying until a module is caught.
 
     Args:
         firmware:     Parsed firmware (must carry the original ``s19_text``).
@@ -150,9 +151,19 @@ def run_flash(
         plc_found:    ``(serial, module_label)`` invoked once SCAN identifies
                       the connected PLC, before erase begins.
         log_line:     Each raw stdout line, forwarded to the GUI log panel.
-        cancel_check: Returns True to request early subprocess termination.
+        cancel_check: Returns True to request early termination (between and
+                      during attempts).
         flasher_exe:  Override exe path (uses ``find_console_flasher`` otherwise).
         extra_args:   Extra CLI args appended after ``/lngid 2``.
+        retries:      Max number of scan passes. The console flasher scans once
+                      and exits, so a *blank* module is caught on attempt 1, but
+                      a *programmed* module only sits in the bootloader for a few
+                      ms per power-up — reflashing it needs many passes while the
+                      operator repeatedly power-cycles it (this is what MRS's own
+                      flasher does internally). Retrying stops immediately on
+                      success, on cancel, or on any failure where a module WAS
+                      found (e.g. article mismatch) — retrying only helps the
+                      "no module found after SCAN" case.
     """
     if not firmware.s19_text:
         raise ValueError('Firmware has no raw .s19 text — cannot flash.')
@@ -172,78 +183,114 @@ def run_flash(
             *extra_args,
         ]
         log.info('Spawning flasher: %s', ' '.join(cmd))
-        progress(0.0, 'Starter flasher…')
 
-        # CREATE_NO_WINDOW prevents a stray console window in dev runs.
-        creationflags = 0x08000000 if os.name == 'nt' else 0
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            bufsize=0,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            creationflags=creationflags,
-            cwd=str(work_dir),
-        )
+        total   = max(1, retries)
+        result  = FlashResult(success=False, exit_code=-1)
+        for attempt in range(1, total + 1):
+            if cancel_check():
+                break
+            if total > 1:
+                progress(0.0, f'Searching for module — power-cycle it now '
+                              f'(attempt {attempt}/{total})…')
+            else:
+                progress(0.0, 'Starter flasher…')
 
-        result      = FlashResult(success=False, exit_code=-1)
-        captured: list[str] = []
-        scan_pending = False     # next non-empty line after "Module(s) found"
-        buf         = ''
+            result = _flash_attempt(exe, cmd, work_dir, progress,
+                                    plc_found, log_line, cancel_check)
 
-        try:
-            assert proc.stdout is not None
-            while True:
-                if cancel_check():
-                    proc.terminate()
-                    break
+            if result.success:
+                break
+            # A module WAS found but the flash itself failed (wrong article,
+            # programming aborted, …) — retrying won't help, so surface it.
+            if result.serial:
+                break
+            # Otherwise no module was caught this pass; loop so the operator
+            # can power-cycle again and we scan afresh.
 
-                chunk = proc.stdout.read(64)
-                if not chunk:
-                    break
-                buf += chunk
-                lines, buf = _split_lines(buf)
-
-                for line in lines:
-                    if not line.strip():
-                        continue
-                    captured.append(line)
-                    log_line(line)
-                    _consume_line(line, result, scan_state := [scan_pending],
-                                  plc_found, progress)
-                    scan_pending = scan_state[0]
-
-            if buf.strip():
-                captured.append(buf)
-                log_line(buf)
-                _consume_line(buf, result, [scan_pending], plc_found, progress)
-
-            exit_code = proc.wait()
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-
-        result.exit_code = exit_code
-        result.success   = (exit_code == 0)
-        result.output    = '\n'.join(captured)
-
-        if result.success:
-            progress(1.0, 'Flash complete')
-        else:
-            msg = result.error_message or f'Flasher exited with code {exit_code}'
+        if not result.success and not cancel_check():
+            msg = result.error_message or f'Flasher exited with code {result.exit_code}'
             progress(1.0, msg)
 
         return result
 
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _flash_attempt(
+    exe:          Path,
+    cmd:          list,
+    work_dir:     Path,
+    progress:     Callable[[float, str], None],
+    plc_found:    Callable[[str, str], None],
+    log_line:     Callable[[str], None],
+    cancel_check: Callable[[], bool],
+) -> FlashResult:
+    """Run the console flasher exactly once and return its parsed FlashResult."""
+    # CREATE_NO_WINDOW prevents a stray console window in dev runs.
+    creationflags = 0x08000000 if os.name == 'nt' else 0
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        bufsize=0,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        creationflags=creationflags,
+        cwd=str(work_dir),
+    )
+
+    result      = FlashResult(success=False, exit_code=-1)
+    captured: list[str] = []
+    scan_pending = False     # next non-empty line after "Module(s) found"
+    buf         = ''
+
+    try:
+        assert proc.stdout is not None
+        while True:
+            if cancel_check():
+                proc.terminate()
+                break
+
+            chunk = proc.stdout.read(64)
+            if not chunk:
+                break
+            buf += chunk
+            lines, buf = _split_lines(buf)
+
+            for line in lines:
+                if not line.strip():
+                    continue
+                captured.append(line)
+                log_line(line)
+                _consume_line(line, result, scan_state := [scan_pending],
+                              plc_found, progress)
+                scan_pending = scan_state[0]
+
+        if buf.strip():
+            captured.append(buf)
+            log_line(buf)
+            _consume_line(buf, result, [scan_pending], plc_found, progress)
+
+        exit_code = proc.wait()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    result.exit_code = exit_code
+    result.success   = (exit_code == 0)
+    result.output    = '\n'.join(captured)
+
+    if result.success:
+        progress(1.0, 'Flash complete')
+
+    return result
 
 
 def _consume_line(
