@@ -119,11 +119,29 @@ $Release = Invoke-RestMethod -Method Post `
     -Uri "https://api.github.com/repos/$RepoOwner/$RepoName/releases" `
     -Headers $Headers -Body $Body -ContentType 'application/json'
 
-# --- 6. Upload the exe asset ------------------------------------------------
+# --- 6. Upload the exe asset (with retries) ---------------------------------
+# The 136 MB upload occasionally drops mid-stream. Retry a few times, deleting
+# any partial asset of the same name between attempts.
 Step "Uploading $ExeName"
 $UploadUrl = ($Release.upload_url -replace '\{\?.*\}', '') + "?name=$ExeName"
-Invoke-RestMethod -Method Post -Uri $UploadUrl -Headers $Headers `
-    -ContentType 'application/octet-stream' -InFile $DistExe -TimeoutSec 600 | Out-Null
+$uploaded = $false
+for ($try = 1; $try -le 4 -and -not $uploaded; $try++) {
+    try {
+        # Remove any leftover/partial asset from a previous failed attempt.
+        $cur = Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoOwner/$RepoName/releases/$($Release.id)/assets" -Headers $Headers
+        $cur | Where-Object { $_.name -eq $ExeName } | ForEach-Object {
+            Invoke-RestMethod -Method Delete -Uri $_.url -Headers $Headers | Out-Null
+        }
+        Write-Host "  upload attempt $try/4..."
+        Invoke-RestMethod -Method Post -Uri $UploadUrl -Headers $Headers `
+            -ContentType 'application/octet-stream' -InFile $DistExe -TimeoutSec 900 | Out-Null
+        $uploaded = $true
+    } catch {
+        Write-Host "  upload attempt $try failed: $($_.Exception.Message)"
+        Start-Sleep -Seconds 3
+    }
+}
+if (-not $uploaded) { throw "Asset upload failed after 4 attempts." }
 
 # --- 7. Verify --------------------------------------------------------------
 Step "Verifying"
