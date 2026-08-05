@@ -235,7 +235,12 @@ def run_flash(
     s19_path = work_dir / 'firmware.s19'
 
     try:
-        s19_path.write_text(firmware.s19_text, encoding='ascii')
+        # Normalize to clean CRLF lines and drop blanks. The classical console
+        # tolerated stray/doubled CR and blank lines, but the .NET flasher's
+        # S19 parser is strict and fails with "Index was outside the bounds of
+        # the array" on them. splitlines() handles \n, \r\n and \r uniformly.
+        _s19_lines = [ln for ln in firmware.s19_text.splitlines() if ln.strip()]
+        s19_path.write_bytes(('\r\n'.join(_s19_lines) + '\r\n').encode('ascii'))
 
         if net_baud:
             exe = find_net_flasher()
