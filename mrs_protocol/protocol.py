@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +62,35 @@ class PLCInfo:
 
 class ScanError(Exception):
     """Raised when SCAN can't reach the PLC or the PLC responds unexpectedly."""
+
+
+class _TracingBus:
+    """Wraps a python-can Bus so every frame sent/received is reported to
+    ``on_frame(direction, arb_id, data)`` — used to feed the GUI's CAN trace
+    window. All other attributes proxy straight through to the real bus.
+    """
+    def __init__(self, bus, on_frame: Callable[[str, int, bytes], None]) -> None:
+        self._bus = bus
+        self._on_frame = on_frame
+
+    def send(self, msg) -> None:
+        self._bus.send(msg)
+        try:
+            self._on_frame('Tx', msg.arbitration_id, bytes(msg.data))
+        except Exception:
+            pass
+
+    def recv(self, timeout=None):
+        msg = self._bus.recv(timeout=timeout)
+        if msg is not None:
+            try:
+                self._on_frame('Rx', msg.arbitration_id, bytes(msg.data))
+            except Exception:
+                pass
+        return msg
+
+    def shutdown(self) -> None:
+        self._bus.shutdown()
 
 
 class PartialScanError(ScanError):
@@ -124,6 +154,7 @@ def scan_plc(
     is_can_fd:    bool  = False,
     data_bitrate: int   = 0,
     timeout:      float = TIMEOUT_BOOT_ANNOUNCE,
+    on_frame:     Callable[[str, int, bytes], None] = lambda d, i, data: None,
 ) -> PLCInfo:
     """Wait for a PLC boot announcement, handshake, read identity info.
 
@@ -145,11 +176,9 @@ def scan_plc(
     classical 125 kbit/s.
     """
     import can
-    bus = can.Bus(
-        interface='pcan',
-        channel=channel,
-        bitrate=125000,
-        fd=False,
+    bus = _TracingBus(
+        can.Bus(interface='pcan', channel=channel, bitrate=125000, fd=False),
+        on_frame,
     )
     try:
         info = PLCInfo()
