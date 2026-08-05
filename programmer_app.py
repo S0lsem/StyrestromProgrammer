@@ -1377,19 +1377,18 @@ class MainWindow(QMainWindow):
         firmware     = self._firmware
         cfg          = MODULE_TYPES[module_name]
 
-        # CAN FD module type → use the newer .NET flasher at e.g. 500k:2000k,
-        # which can catch a programmed module at its firmware's baud (the old
-        # console is classical-only and can't reach it). --restart-module does
-        # the boot entry, so no manual power-cycle loop is needed there.
+        # All flashing goes through the newer .NET flasher. The classical
+        # console (V1.41.10) can't read the current MRS firmware format at all
+        # ("No data found"), and can't reach a module running at its app baud.
+        # The .NET flasher reads the firmware and speaks every baud; the module
+        # dropdown picks it: 125k (blank/bootloader), 500k (programmed
+        # classical), or 500k:2000k (CAN FD). --restart-module drops a running
+        # module into the bootloader so it's caught at its app baud.
         if cfg['can_fd'] and cfg['data_bitrate']:
             net_baud = f"{cfg['bitrate'] // 1000}k:{cfg['data_bitrate'] // 1000}k"
-            # A few auto-retries: the erased bootloader stays reachable at the
-            # FD baud between passes, so an intermittent ErrorWhileFlashing
-            # recovers on the next attempt (as it did manually).
-            retries  = 4
         else:
-            net_baud = None
-            retries  = REFLASH_RETRIES
+            net_baud = f"{cfg['bitrate'] // 1000}k"
+        retries = 4
 
         self._last_plc_info = None
         self._flashing = True
@@ -1399,17 +1398,10 @@ class MainWindow(QMainWindow):
         self._progress_bar.setValue(0)
         self._status_label.setText('Starter flasher…')
         self._append_log(f'Starting flash — module: {module_name}  channel: {channel}')
-        if net_baud:
-            self._append_log(
-                f'CAN FD flasher at {net_baud} (restart-module) — for a '
-                'programmed module keep it powered; power-cycle only if asked. '
-                'Click Stop to abort.'
-            )
-        else:
-            self._append_log(
-                'Flasher will keep scanning — power-cycle the PLC (repeatedly for '
-                'an already-programmed module) until it is caught. Click Stop to abort.'
-            )
+        self._append_log(
+            f'Flashing at {net_baud} (restart-module). Programmed module: keep '
+            'it powered. Blank module: power-cycle to catch the boot. Stop to abort.'
+        )
 
         self._flash_worker = FlashWorker(firmware, retries=retries, net_baud=net_baud)
         self._flash_thread = QThread()

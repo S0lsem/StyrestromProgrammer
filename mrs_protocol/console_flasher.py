@@ -280,7 +280,7 @@ def run_flash(
             if cancel_check():
                 break
             if total > 1 and net_baud:
-                progress(0.0, f'Flashing CAN FD module (attempt {attempt}/{total})…')
+                progress(0.0, f'Flashing module (attempt {attempt}/{total})…')
             elif total > 1:
                 progress(0.0, f'Searching for module — power-cycle it now '
                               f'(attempt {attempt}/{total})…')
