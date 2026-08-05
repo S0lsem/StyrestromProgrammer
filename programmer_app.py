@@ -1383,7 +1383,10 @@ class MainWindow(QMainWindow):
         # the boot entry, so no manual power-cycle loop is needed there.
         if cfg['can_fd'] and cfg['data_bitrate']:
             net_baud = f"{cfg['bitrate'] // 1000}k:{cfg['data_bitrate'] // 1000}k"
-            retries  = 1
+            # A few auto-retries: the erased bootloader stays reachable at the
+            # FD baud between passes, so an intermittent ErrorWhileFlashing
+            # recovers on the next attempt (as it did manually).
+            retries  = 4
         else:
             net_baud = None
             retries  = REFLASH_RETRIES

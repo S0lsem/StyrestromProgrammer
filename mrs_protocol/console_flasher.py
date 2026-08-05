@@ -249,6 +249,11 @@ def run_flash(
                 '--baudrate', net_baud,
                 '--driver', 'PCANBasic',
                 '--restart-module',
+                # Fast mode checks CRC per line, not per message — the flasher's
+                # own help flags it as "potentially unstable", and it caused
+                # intermittent ErrorWhileFlashing mid-upload. Force it off for
+                # reliable writes (slightly slower, still seconds).
+                '--fastmode', 'false',
                 *extra_args,
             ]
         else:
@@ -266,7 +271,9 @@ def run_flash(
         for attempt in range(1, total + 1):
             if cancel_check():
                 break
-            if total > 1:
+            if total > 1 and net_baud:
+                progress(0.0, f'Flashing CAN FD module (attempt {attempt}/{total})…')
+            elif total > 1:
                 progress(0.0, f'Searching for module — power-cycle it now '
                               f'(attempt {attempt}/{total})…')
             else:
