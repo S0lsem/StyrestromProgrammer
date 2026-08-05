@@ -54,6 +54,37 @@ else:
         'MRS_CONSOLE_FLASHER_DIR to the folder containing the exe + DLLs.'
     )
 
+# ---------------------------------------------------------------------------
+# Bundle the newer CAN-FD-capable .NET flasher (ConsoleFlasherNet) too, so
+# distributors can reflash programmed CAN FD modules (500k/2000k) without
+# having MRS Applics Studio installed. It is a self-contained single-file exe.
+# Override the source dir with MRS_NET_FLASHER_DIR if needed.
+# ---------------------------------------------------------------------------
+_net_src_override = os.environ.get('MRS_NET_FLASHER_DIR')
+if _net_src_override:
+    _net_src = Path(_net_src_override)
+else:
+    _net_candidates = sorted(
+        Path(os.environ.get('LOCALAPPDATA', '.')).glob(
+            'ApplicsStudio/app-*/Tools/ConsoleFlasherNet'
+        ),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    _net_src = _net_candidates[0] if _net_candidates else None
+
+if _net_src and _net_src.is_dir():
+    for f in _net_src.rglob('*'):
+        if f.is_file():
+            dest = Path('ConsoleFlasherNet') / f.relative_to(_net_src).parent
+            console_flasher_datas.append((str(f), str(dest)))
+else:
+    raise SystemExit(
+        'Cannot locate CAN_Flasher_NET_Console.exe to bundle. '
+        'Update MRS Applics Studio on the build machine, or set '
+        'MRS_NET_FLASHER_DIR to the folder containing it.'
+    )
+
 a = Analysis(
     ['programmer_app.py'],
     pathex=['.'],
