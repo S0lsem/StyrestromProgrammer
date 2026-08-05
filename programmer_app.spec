@@ -89,7 +89,9 @@ a = Analysis(
     ['programmer_app.py'],
     pathex=['.'],
     binaries=qt_binaries,
-    datas=qt_datas + console_flasher_datas,
+    # icon.ico is bundled at the root so the app can set it as the runtime
+    # window/taskbar icon (setWindowIcon); it's also the exe icon below.
+    datas=qt_datas + console_flasher_datas + [('icon.ico', '.')],
     hiddenimports=(
         qt_hidden
         + can_hidden
@@ -123,5 +125,5 @@ exe = EXE(
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,          # no black console window behind the GUI
-    # icon='icon.ico',      # uncomment and add icon.ico to use a custom icon
+    icon='icon.ico',        # Styrestrøm logo as the exe / taskbar icon
 )

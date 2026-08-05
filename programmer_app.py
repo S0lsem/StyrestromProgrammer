@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QSettings
-from PyQt6.QtGui import QAction, QFont
+from PyQt6.QtGui import QAction, QFont, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -1798,9 +1798,23 @@ class _ListPartsWorker(QObject):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _app_icon_path() -> Optional[Path]:
+    """Locate the bundled icon.ico (PyInstaller _MEIPASS when frozen, else the
+    source folder). Returns None if it isn't present."""
+    if getattr(sys, 'frozen', False):
+        base = Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
+    else:
+        base = Path(__file__).parent
+    p = base / 'icon.ico'
+    return p if p.exists() else None
+
+
 def main() -> None:
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    _icon = _app_icon_path()
+    if _icon:
+        app.setWindowIcon(QIcon(str(_icon)))
     win = MainWindow()
     if not win._login_ok:
         # Operator cancelled the login gate — nothing to show.
