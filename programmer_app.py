@@ -441,10 +441,12 @@ class FlashWorker(QObject):
     error      = pyqtSignal(str)
     cancelled  = pyqtSignal()
 
-    def __init__(self, firmware: Firmware, retries: int = 1) -> None:
+    def __init__(self, firmware: Firmware, retries: int = 1,
+                 net_baud: Optional[str] = None) -> None:
         super().__init__()
         self._firmware = firmware
         self._retries  = retries
+        self._net_baud = net_baud
         self._cancel   = False
 
     def cancel(self) -> None:
@@ -461,6 +463,7 @@ class FlashWorker(QObject):
                 plc_found=_on_plc,
                 cancel_check=lambda: self._cancel,
                 retries=self._retries,
+                net_baud=self._net_baud,
             )
 
             if self._cancel:
@@ -1372,6 +1375,18 @@ class MainWindow(QMainWindow):
         module_name  = self._module_combo.currentText()
         channel      = self._detected_channel
         firmware     = self._firmware
+        cfg          = MODULE_TYPES[module_name]
+
+        # CAN FD module type → use the newer .NET flasher at e.g. 500k:2000k,
+        # which can catch a programmed module at its firmware's baud (the old
+        # console is classical-only and can't reach it). --restart-module does
+        # the boot entry, so no manual power-cycle loop is needed there.
+        if cfg['can_fd'] and cfg['data_bitrate']:
+            net_baud = f"{cfg['bitrate'] // 1000}k:{cfg['data_bitrate'] // 1000}k"
+            retries  = 1
+        else:
+            net_baud = None
+            retries  = REFLASH_RETRIES
 
         self._last_plc_info = None
         self._flashing = True
@@ -1381,12 +1396,19 @@ class MainWindow(QMainWindow):
         self._progress_bar.setValue(0)
         self._status_label.setText('Starter flasher…')
         self._append_log(f'Starting flash — module: {module_name}  channel: {channel}')
-        self._append_log(
-            'Flasher will keep scanning — power-cycle the PLC (repeatedly for an '
-            'already-programmed module) until it is caught. Click Stop to abort.'
-        )
+        if net_baud:
+            self._append_log(
+                f'CAN FD flasher at {net_baud} (restart-module) — for a '
+                'programmed module keep it powered; power-cycle only if asked. '
+                'Click Stop to abort.'
+            )
+        else:
+            self._append_log(
+                'Flasher will keep scanning — power-cycle the PLC (repeatedly for '
+                'an already-programmed module) until it is caught. Click Stop to abort.'
+            )
 
-        self._flash_worker = FlashWorker(firmware, retries=REFLASH_RETRIES)
+        self._flash_worker = FlashWorker(firmware, retries=retries, net_baud=net_baud)
         self._flash_thread = QThread()
         self._flash_worker.moveToThread(self._flash_thread)
 

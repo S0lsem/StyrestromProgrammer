@@ -31,6 +31,9 @@ from .s19_parser import Firmware
 log = logging.getLogger(__name__)
 
 _FLASHER_EXE_NAME = 'MRS_Developers_Studio_Console.exe'
+# The newer .NET "Applics Flasher" — unlike the classical console above, it
+# speaks CAN FD, so it can catch a *programmed* module that boots at 500k/2000k.
+_NET_FLASHER_EXE_NAME = 'CAN_Flasher_NET_Console.exe'
 
 _PROGRESS_RE     = re.compile(r'\]\s*(\d+)%')
 _SCAN_HEADER_RE  = re.compile(r'Module\(s\) found')
@@ -118,6 +121,58 @@ def find_console_flasher() -> Path:
     )
 
 
+def find_net_flasher() -> Path:
+    """Locate the newer CAN-FD-capable Applics Flasher (.NET console).
+
+    Same search strategy as :func:`find_console_flasher`, but for
+    ``CAN_Flasher_NET_Console.exe`` under ``Tools/ConsoleFlasherNet``. Used to
+    flash modules whose firmware has switched them to CAN FD (500k/2000k), which
+    the classical console cannot reach.
+    """
+    override = os.environ.get('MRS_NET_FLASHER_EXE')
+    if override:
+        p = Path(override)
+        if p.is_file():
+            return p
+        raise FileNotFoundError(
+            f'MRS_NET_FLASHER_EXE points at non-existent file: {p}'
+        )
+
+    if getattr(sys, 'frozen', False):
+        for root in (getattr(sys, '_MEIPASS', None), Path(sys.executable).parent):
+            if not root:
+                continue
+            bundled = Path(root) / 'ConsoleFlasherNet' / _NET_FLASHER_EXE_NAME
+            if bundled.is_file():
+                return bundled
+
+    appdata = os.environ.get('LOCALAPPDATA')
+    if appdata:
+        candidates = sorted(
+            Path(appdata).glob(
+                f'ApplicsStudio/app-*/Tools/ConsoleFlasherNet/{_NET_FLASHER_EXE_NAME}'
+            ),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for c in candidates:
+            if c.is_file():
+                return c
+
+    for root in ('C:/Program Files', 'C:/Program Files (x86)'):
+        rp = Path(root)
+        if not rp.exists():
+            continue
+        for c in rp.rglob(_NET_FLASHER_EXE_NAME):
+            if c.is_file():
+                return c
+
+    raise FileNotFoundError(
+        f'{_NET_FLASHER_EXE_NAME} not found. Update MRS Applics Studio or '
+        'set MRS_NET_FLASHER_EXE to its full path.'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Stdout splitting
 # ---------------------------------------------------------------------------
@@ -142,6 +197,7 @@ def run_flash(
     flasher_exe:  Optional[Path]               = None,
     extra_args:   tuple                        = (),
     retries:      int                          = 1,
+    net_baud:     Optional[str]                = None,
 ) -> FlashResult:
     """Run a flash via the MRS console flasher, retrying until a module is caught.
 
@@ -164,11 +220,16 @@ def run_flash(
                       success, on cancel, or on any failure where a module WAS
                       found (e.g. article mismatch) — retrying only helps the
                       "no module found after SCAN" case.
+        net_baud:     When set (e.g. ``'500k:2000k'``), use the newer .NET
+                      Applics Flasher at that CAN FD baud instead of the
+                      classical console. Required to reach a *programmed* CAN FD
+                      module, which boots at its firmware's baud, not 125k. The
+                      ``A:B`` form selects CAN FD; ``--restart-module`` commands
+                      a running module into the bootloader so no power-cycle is
+                      needed. Success/failure comes from the process exit code.
     """
     if not firmware.s19_text:
         raise ValueError('Firmware has no raw .s19 text — cannot flash.')
-
-    exe = flasher_exe or find_console_flasher()
 
     work_dir = Path(tempfile.mkdtemp(prefix='mrs_flash_'))
     s19_path = work_dir / 'firmware.s19'
@@ -176,12 +237,23 @@ def run_flash(
     try:
         s19_path.write_text(firmware.s19_text, encoding='ascii')
 
-        cmd = [
-            str(exe),
-            '/s19_file', str(s19_path),
-            '/lngid', '2',          # English — output regexes are anchored to English
-            *extra_args,
-        ]
+        if net_baud:
+            exe = find_net_flasher()
+            cmd = [
+                str(exe), 'device', 'upload', str(s19_path),
+                '--baudrate', net_baud,
+                '--driver', 'PCANBasic',
+                '--restart-module',
+                *extra_args,
+            ]
+        else:
+            exe = flasher_exe or find_console_flasher()
+            cmd = [
+                str(exe),
+                '/s19_file', str(s19_path),
+                '/lngid', '2',      # English — output regexes are anchored to English
+                *extra_args,
+            ]
         log.info('Spawning flasher: %s', ' '.join(cmd))
 
         total   = max(1, retries)
