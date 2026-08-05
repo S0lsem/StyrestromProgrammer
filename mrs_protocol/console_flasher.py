@@ -35,12 +35,18 @@ _FLASHER_EXE_NAME = 'MRS_Developers_Studio_Console.exe'
 # speaks CAN FD, so it can catch a *programmed* module that boots at 500k/2000k.
 _NET_FLASHER_EXE_NAME = 'CAN_Flasher_NET_Console.exe'
 
-_PROGRESS_RE     = re.compile(r'\]\s*(\d+)%')
+_PROGRESS_RE     = re.compile(r'\]\s*(\d+)\s*%')   # matches ']45%' and '] 45 %' (.NET)
 _SCAN_HEADER_RE  = re.compile(r'Module\(s\) found')
 _SCAN_LINE_RE    = re.compile(r'^(\d+)\s+(NO PROG|PROG|OK)\s*:\s*(.+)$')
 _FINISHED_RE     = re.compile(
     r'Programm\s+finshed:\s+0x([0-9A-Fa-f]+)\s+\((\d+)\):\s*(.*)'
 )
+
+# .NET "Applics Flasher" module-info lines (printed before the reflash
+# overwrites the module), used to show what was on the unit beforehand.
+_NET_NAME_RE    = re.compile(r'\bName:\s*(\S.*)')
+_NET_SERIAL_RE  = re.compile(r'Serial number:\s*(\d+)')
+_NET_APPVER_RE  = re.compile(r'App Version:\s*(\S.*)')
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +405,23 @@ def _consume_line(
 
     if _SCAN_HEADER_RE.search(line):
         scan_state[0] = True
+
+    # .NET flasher module identity (before the reflash). Name comes first, then
+    # serial, then app version — fire plc_found on the version line so the GUI
+    # shows the SN + the firmware that was on the unit before we overwrote it.
+    m = _NET_NAME_RE.search(line)
+    if m:
+        result.module_label = m.group(1).strip()
+    m = _NET_SERIAL_RE.search(line)
+    if m:
+        result.serial = m.group(1)
+    m = _NET_APPVER_RE.search(line)
+    if m:
+        ver   = m.group(1).strip()
+        name  = result.module_label
+        label = f'{name} : {ver}' if name else ver
+        plc_found(result.serial, label)
+        progress(0.05, '')
 
     m = _PROGRESS_RE.search(line)
     if m:
