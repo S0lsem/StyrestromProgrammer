@@ -167,13 +167,17 @@ def scan_plc(
     Raises ScanError on timeout or malformed response.
 
     Note: the ``bitrate`` / ``is_can_fd`` / ``data_bitrate`` arguments are
-    accepted for signature stability but intentionally ignored — the MRS
-    bootloader ALWAYS announces in classical CAN at 125 kbit/s, even on CAN FD
-    modules (the app baud only applies once the module's firmware is running).
-    Opening the bus in FD mode here would both miss the boot announcement and
-    make the PCAN driver reject the plain bitrate settings
-    ("A parameter contains an invalid value"), so Scan is hard-wired to
-    classical 125 kbit/s.
+    accepted for signature stability but intentionally ignored — Scan is
+    hard-wired to classical 125 kbit/s. That is the boot-mode bus, where a
+    *blank* module sits and announces itself indefinitely (CAN FD parts
+    included). Opening the bus in FD mode here would miss that announcement and
+    make the PCAN driver reject the plain bitrate settings ("A parameter
+    contains an invalid value").
+
+    Consequence: a *programmed* module cannot be scanned. Once its firmware
+    runs it is on the app baud (500k, or 500k:2000k for CAN FD) and never
+    appears at 125k, which is why flashing one goes through the .NET flasher
+    with ``--restart-module`` at the app baud instead.
     """
     import can
     bus = _TracingBus(

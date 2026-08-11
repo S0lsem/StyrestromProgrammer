@@ -127,6 +127,17 @@ from mrs_protocol.version import APP_VERSION
 from mrs_protocol import auth
 
 
+def describe_baud(bitrate: int, is_can_fd: bool, data_bitrate: int) -> str:
+    """Human/CLI form of a module's bus config: ``'125k'`` or ``'500k:2000k'``.
+
+    Doubles as the ``--baudrate`` argument for the .NET flasher, so the flash
+    path and the batch listener can never drift onto different buses.
+    """
+    if is_can_fd and data_bitrate:
+        return f'{bitrate // 1000}k:{data_bitrate // 1000}k'
+    return f'{bitrate // 1000}k'
+
+
 # ---------------------------------------------------------------------------
 # Update check worker
 # ---------------------------------------------------------------------------
@@ -373,6 +384,13 @@ class ScanWorker(QObject):
 # boot announcement so the GUI can auto-trigger the next flash. The bus is
 # released as soon as the announcement is seen because the console flasher
 # needs exclusive PCAN access.
+#
+# The listener MUST sit on the same bus the module talks on, which is the baud
+# from the module dropdown — not a fixed 125k. Only a blank module stays in the
+# 125k bootloader; a programmed one announces at its app baud (500k classical,
+# or 500k:2000k CAN FD) and then runs its firmware. Listening at 125k to a
+# CAN FD module hears nothing at all, which is why batch mode never
+# auto-triggered for CAN FD and every unit had to be flashed by hand.
 # ---------------------------------------------------------------------------
 
 class BatchListenerWorker(QObject):
@@ -380,9 +398,13 @@ class BatchListenerWorker(QObject):
     error        = pyqtSignal(str)
     frame        = pyqtSignal(str, int, bytes)  # (direction, arb_id, data) for the trace
 
-    def __init__(self, channel: str) -> None:
+    def __init__(self, channel: str, bitrate: int = 125000,
+                 is_can_fd: bool = False, data_bitrate: int = 0) -> None:
         super().__init__()
-        self._channel = channel
+        self._channel      = channel
+        self._bitrate      = bitrate
+        self._is_can_fd    = is_can_fd
+        self._data_bitrate = data_bitrate
         self._stop = False
 
     def request_stop(self) -> None:
@@ -391,15 +413,23 @@ class BatchListenerWorker(QObject):
     def run(self) -> None:
         from mrs_protocol.protocol import CAN_ID_PLC_BOOT
         import can
+        # Same open as detect_adapter()/the flash path so a bus that Detect
+        # could open is a bus the listener can open.
+        kwargs = {
+            'interface': 'pcan',
+            'channel':   self._channel,
+            'bitrate':   self._bitrate,
+            'fd':        self._is_can_fd,
+        }
+        if self._is_can_fd and self._data_bitrate:
+            kwargs['data_bitrate'] = self._data_bitrate
         try:
-            bus = can.Bus(
-                interface='pcan',
-                channel=self._channel,
-                bitrate=125000,
-                fd=False,
-            )
+            bus = can.Bus(**kwargs)
         except Exception as exc:
-            self.error.emit(f'Batch listener could not open PCAN at 125k: {exc}')
+            self.error.emit(
+                f'Batch listener could not open PCAN at '
+                f'{describe_baud(self._bitrate, self._is_can_fd, self._data_bitrate)}: {exc}'
+            )
             return
 
         serial = 0
@@ -610,6 +640,9 @@ class MainWindow(QMainWindow):
         self._module_combo = QComboBox()
         for name in MODULE_TYPES:
             self._module_combo.addItem(name)
+        # The batch listener is baud-specific, so it must follow the dropdown;
+        # otherwise switching to CAN FD mid-session leaves it on the old bus.
+        self._module_combo.currentIndexChanged.connect(self._on_module_changed)
         conn_layout.addWidget(self._module_combo)
         conn_layout.addSpacing(16)
 
@@ -666,7 +699,11 @@ class MainWindow(QMainWindow):
         self._batch_check.setToolTip(
             'When checked, firmware stays loaded after flashing and the app\n'
             'listens for the next PLC to boot. Power-cycle the next PLC and\n'
-            'flashing starts automatically — no need to click Flash PLC.'
+            'flashing starts automatically — no need to click Flash PLC.\n'
+            '\n'
+            'The listener uses the baud from the module dropdown, so that\n'
+            'must match the units you are running (125k for blank/boot mode,\n'
+            '500k or 500k:2000k CAN FD for already-programmed units).'
         )
         self._batch_check.stateChanged.connect(self._on_batch_toggled)
         batch_layout.addWidget(self._batch_check)
@@ -1235,6 +1272,15 @@ class MainWindow(QMainWindow):
     # Batch listener — auto-flash next power-cycled PLC
     # ------------------------------------------------------------------
 
+    def _on_module_changed(self, _index: int) -> None:
+        """Re-arm the batch listener on the newly selected module's bus."""
+        # May fire while the UI is still being built, before _batch_check exists.
+        check = getattr(self, '_batch_check', None)
+        if check is None or not check.isChecked():
+            return
+        self._stop_batch_listener()
+        self._maybe_start_batch_listener()
+
     def _on_batch_toggled(self, _state: int) -> None:
         if self._batch_check.isChecked():
             self._maybe_start_batch_listener()
@@ -1269,7 +1315,16 @@ class MainWindow(QMainWindow):
             return False
 
     def _start_batch_listener(self) -> None:
-        self._batch_listener = BatchListenerWorker(self._detected_channel)
+        # Listen on the bus the selected module actually talks on. A CAN FD
+        # module never appears on a 125k classical bus, so a fixed 125k
+        # listener would wait forever and batch mode would never fire.
+        cfg = MODULE_TYPES[self._module_combo.currentText()]
+        self._batch_listener = BatchListenerWorker(
+            self._detected_channel,
+            bitrate=cfg['bitrate'],
+            is_can_fd=cfg['can_fd'],
+            data_bitrate=cfg['data_bitrate'],
+        )
         self._batch_thread = QThread()
         self._batch_listener.moveToThread(self._batch_thread)
 
@@ -1288,8 +1343,12 @@ class MainWindow(QMainWindow):
         self._batch_thread.finished.connect(self._batch_thread.deleteLater)
 
         self._batch_thread.start()
-        self._status_label.setText('Batch mode — waiting for next PLC…')
-        self._append_log('Batch mode: listening for next PLC boot announcement.')
+        baud = describe_baud(cfg['bitrate'], cfg['can_fd'], cfg['data_bitrate'])
+        self._status_label.setText(f'Batch mode — waiting for next PLC ({baud})…')
+        self._append_log(
+            f'Batch mode: listening at {baud} for the next PLC boot announcement. '
+            f'Power-cycle the next module to start its flash.'
+        )
 
     def _on_batch_thread_finished(self) -> None:
         """Drop Python refs once the thread has fully exited. Safe because
@@ -1384,10 +1443,7 @@ class MainWindow(QMainWindow):
         # dropdown picks it: 125k (blank/bootloader), 500k (programmed
         # classical), or 500k:2000k (CAN FD). --restart-module drops a running
         # module into the bootloader so it's caught at its app baud.
-        if cfg['can_fd'] and cfg['data_bitrate']:
-            net_baud = f"{cfg['bitrate'] // 1000}k:{cfg['data_bitrate'] // 1000}k"
-        else:
-            net_baud = f"{cfg['bitrate'] // 1000}k"
+        net_baud = describe_baud(cfg['bitrate'], cfg['can_fd'], cfg['data_bitrate'])
         retries = 4
 
         self._last_plc_info = None
