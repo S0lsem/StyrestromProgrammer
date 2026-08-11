@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable
 
@@ -84,7 +85,12 @@ class _TracingBus:
         msg = self._bus.recv(timeout=timeout)
         if msg is not None:
             try:
-                self._on_frame('Rx', msg.arbitration_id, bytes(msg.data))
+                # Error frames are NOT bus traffic — PCAN emits one whenever it
+                # sees edges it can't decode, which is what a bit-rate mismatch
+                # looks like. Tracing them as 'Rx' makes a dead bus look busy
+                # and sends you hunting for a protocol bug that isn't there.
+                direction = 'Er' if getattr(msg, 'is_error_frame', False) else 'Rx'
+                self._on_frame(direction, msg.arbitration_id, bytes(msg.data))
             except Exception:
                 pass
         return msg
@@ -110,6 +116,85 @@ class PartialScanError(ScanError):
 
 
 # ---------------------------------------------------------------------------
+# Bus opening
+# ---------------------------------------------------------------------------
+
+# PCAN clocks python-can will accept for CAN FD, best first. 80 MHz divides
+# cleanly for 500k:2000k; the rest are fallbacks for future baud combinations.
+_PCAN_FD_CLOCKS = (80_000_000, 60_000_000, 40_000_000, 30_000_000,
+                   24_000_000, 20_000_000)
+
+
+def open_pcan(channel: str, bitrate: int, is_can_fd: bool = False,
+              data_bitrate: int = 0):
+    """Open a PCAN channel for classical CAN or CAN FD.
+
+    Every bus in this app must go through here. CAN FD cannot be opened by
+    passing ``fd=True`` alongside ``bitrate``/``data_bitrate`` — python-can's
+    PCAN backend ignores both of those in FD mode and instead builds the
+    InitializeFD string from ``f_clock`` plus the eight nom_*/data_* segment
+    values. With none supplied it sends an empty string and PCANBasic answers
+    "A parameter contains an invalid value". Passing a ``BitTimingFd`` fills
+    those segments in, which is the only form that actually opens.
+    """
+    import can
+    if not (is_can_fd and data_bitrate):
+        with _busy_channel_hint():
+            return can.Bus(interface='pcan', channel=channel,
+                           bitrate=bitrate, fd=False)
+
+    from can import BitTimingFd
+    last_exc = None
+    for f_clock in _PCAN_FD_CLOCKS:
+        try:
+            timing = BitTimingFd.from_sample_point(
+                f_clock=f_clock,
+                nom_bitrate=bitrate,    nom_sample_point=87.5,
+                data_bitrate=data_bitrate, data_sample_point=80.0,
+            )
+        except Exception as exc:      # this baud pair doesn't divide this clock
+            last_exc = exc
+            continue
+        with _busy_channel_hint():
+            return can.Bus(interface='pcan', channel=channel, timing=timing)
+    raise ValueError(
+        f'No usable PCAN FD timing for {bitrate}:{data_bitrate} '
+        f'(tried {len(_PCAN_FD_CLOCKS)} clocks): {last_exc}'
+    )
+
+
+class ChannelBusyError(ScanError):
+    """The PCAN channel is held by another process (usually the flasher).
+
+    Subclasses ScanError so the GUI's ``except ScanError`` path shows the
+    message in the normal "Scan failed" dialog. Left as a bare Exception it
+    fell through to the catch-all and the operator got a stack trace.
+    """
+
+
+@contextmanager
+def _busy_channel_hint():
+    """Translate PCAN's cryptic in-use error into something actionable.
+
+    Only ONE process may hold a PCAN channel. While the .NET flasher runs it
+    owns the adapter, so any bus we try to open fails with "A PCAN Channel has
+    not been initialized yet or the initialization process has failed" — which
+    reads like a driver fault rather than "something else is using it".
+    """
+    try:
+        yield
+    except Exception as exc:
+        if 'has not been initialized' in str(exc):
+            raise ChannelBusyError(
+                'The CAN adapter is already in use by another program.\n\n'
+                'This is almost always a flash still running — wait for it to '
+                'finish and try again. Otherwise close any other CAN tool '
+                '(PCAN-View, MRS Applics Studio) and retry.'
+            ) from exc
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Adapter detection
 # ---------------------------------------------------------------------------
 
@@ -124,23 +209,27 @@ def detect_adapter(
     PCAN_USBBUSn that opens successfully (e.g. ``'PCAN_USBBUS1'``);
     on failure it is empty and ``message`` explains why.
     """
-    import can
+    busy = False
     for i in range(1, 17):
         channel = f'PCAN_USBBUS{i}'
         try:
-            kwargs = {
-                'interface':   'pcan',
-                'channel':     channel,
-                'bitrate':     bitrate,
-                'fd':          is_can_fd,
-            }
-            if is_can_fd and data_bitrate:
-                kwargs['data_bitrate'] = data_bitrate
-            bus = can.Bus(**kwargs)
+            bus = open_pcan(channel, bitrate, is_can_fd, data_bitrate)
             bus.shutdown()
             return True, channel, f'Connected on {channel}'
+        except ChannelBusyError:
+            # The adapter IS there — something else is holding it. Don't let
+            # this fall through to "not plugged in", which sends the operator
+            # hunting for a cable fault that doesn't exist.
+            busy = True
+            continue
         except Exception:
             continue
+    if busy:
+        return False, '', (
+            'A CAN adapter is present but in use by another program '
+            '(a flash still running, PCAN-View, or MRS Applics Studio). '
+            'Close it and try again.'
+        )
     return False, '', 'No PCAN-USB adapter found. Is it plugged in?'
 
 
@@ -166,24 +255,26 @@ def scan_plc(
 
     Raises ScanError on timeout or malformed response.
 
-    Note: the ``bitrate`` / ``is_can_fd`` / ``data_bitrate`` arguments are
-    accepted for signature stability but intentionally ignored — Scan is
-    hard-wired to classical 125 kbit/s. That is the boot-mode bus, where a
-    *blank* module sits and announces itself indefinitely (CAN FD parts
-    included). Opening the bus in FD mode here would miss that announcement and
-    make the PCAN driver reject the plain bitrate settings ("A parameter
-    contains an invalid value").
+    ``bitrate`` / ``is_can_fd`` / ``data_bitrate`` come from the app's Module
+    dropdown and select the bus to listen on.
 
-    Consequence: a *programmed* module cannot be scanned. Once its firmware
-    runs it is on the app baud (500k, or 500k:2000k for CAN FD) and never
-    appears at 125k, which is why flashing one goes through the .NET flasher
-    with ``--restart-module`` at the app baud instead.
+    SCOPE — Scan only works on a module sitting in its BOOTLOADER (a blank
+    unit, dropdown "Boot mode (125 kbit/s)"). Those announce themselves
+    repeatedly, so a passive listener catches them.
+
+    A *programmed* module cannot be scanned at any bit rate. It runs its
+    firmware and has no reason to announce anything; the only way to reach it
+    is to actively command it into the bootloader, which is what the .NET
+    flasher's ``--restart-module`` does and this passive scan does not
+    implement. Measured 2026-08-11: with a programmed CAN FD module
+    power-cycling on the bench, every candidate rate (125k/250k/500k/1M
+    classical, 500k:2000k and 250k:1000k FD) produced CAN error frames and
+    zero decodable frames, and the flasher's own ``device list`` found nothing
+    at 500k:2000k — the same rate at which flashing that module succeeds.
+    Flashing needs no Scan, so this is a documented limitation, not a bug.
     """
-    import can
-    bus = _TracingBus(
-        can.Bus(interface='pcan', channel=channel, bitrate=125000, fd=False),
-        on_frame,
-    )
+    bus = _TracingBus(open_pcan(channel, bitrate, is_can_fd, data_bitrate),
+                      on_frame)
     try:
         info = PLCInfo()
 
@@ -221,9 +312,9 @@ def scan_plc(
             raise PartialScanError(
                 info.serial,
                 f'PLC detected (SN {info.serial}), but its full identity could '
-                f'not be read. This is normal for CAN FD modules — they cannot '
-                f'be scanned, but they flash correctly. Just press Flash — no '
-                f'Scan is needed.',
+                f'not be read — the module answered its boot announcement and '
+                f'then stopped responding. The unit is present and flashable: '
+                f'just press Flash, no Scan is needed.',
             ) from exc
 
         log.info(
@@ -244,17 +335,45 @@ def scan_plc(
 
 def _wait_boot_announcement(bus, timeout: float) -> bytes:
     deadline = time.monotonic() + timeout
+    errors = 0          # PCAN error frames: signal present, but undecodable
+    valid  = 0          # frames that decoded cleanly, whatever their ID
     while time.monotonic() < deadline:
         remaining = deadline - time.monotonic()
         msg = bus.recv(timeout=max(remaining, 0))
         if msg is None:
             continue
+        if getattr(msg, 'is_error_frame', False):
+            errors += 1
+            continue
+        valid += 1
         if msg.arbitration_id == CAN_ID_PLC_BOOT and len(msg.data) >= 8:
             data = bytes(msg.data)
             log.info('Boot announcement: %s', data.hex(' ').upper())
             return data[1:5]
+
+    # A burst of error frames with nothing decodable means the module IS
+    # transmitting and we are listening at the wrong bit rate — a completely
+    # different problem from a silent bus, and worth saying so plainly.
+    if errors and not valid:
+        raise ScanError(
+            f'A module is transmitting, but nothing could be decoded at the '
+            f'selected speed ({errors} CAN error frames, 0 valid frames).\n\n'
+            f'This is what an ALREADY-PROGRAMMED module looks like: it is '
+            f'running its firmware, not sitting in the bootloader, so Scan '
+            f'cannot read it. That is expected — just press Flash, which '
+            f'commands the module into the bootloader itself.\n\n'
+            f'Scan only works on blank modules, with the dropdown on '
+            f'"Boot mode (125 kbit/s)".'
+        )
+    if valid:
+        raise ScanError(
+            f'Traffic was seen on the bus ({valid} frames) but no PLC boot '
+            f'announcement among it. Power-cycle the PLC while Scan is running.'
+        )
     raise ScanError(
-        'No PLC boot announcement received. Power-cycle the PLC after clicking Scan.'
+        'No PLC boot announcement received — the bus was completely silent.\n\n'
+        'Power-cycle the PLC after clicking Scan, and check power, CAN-H/CAN-L '
+        'and termination.'
     )
 
 

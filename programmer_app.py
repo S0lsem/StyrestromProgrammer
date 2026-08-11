@@ -411,20 +411,12 @@ class BatchListenerWorker(QObject):
         self._stop = True
 
     def run(self) -> None:
-        from mrs_protocol.protocol import CAN_ID_PLC_BOOT
-        import can
-        # Same open as detect_adapter()/the flash path so a bus that Detect
-        # could open is a bus the listener can open.
-        kwargs = {
-            'interface': 'pcan',
-            'channel':   self._channel,
-            'bitrate':   self._bitrate,
-            'fd':        self._is_can_fd,
-        }
-        if self._is_can_fd and self._data_bitrate:
-            kwargs['data_bitrate'] = self._data_bitrate
+        from mrs_protocol.protocol import CAN_ID_PLC_BOOT, open_pcan
+        # Same open as detect_adapter()/scan_plc so a bus that Detect could
+        # open is a bus the listener can open.
         try:
-            bus = can.Bus(**kwargs)
+            bus = open_pcan(self._channel, self._bitrate,
+                            self._is_can_fd, self._data_bitrate)
         except Exception as exc:
             self.error.emit(
                 f'Batch listener could not open PCAN at '
@@ -684,7 +676,15 @@ class MainWindow(QMainWindow):
         self._scan_btn.setToolTip(
             'Listen for a PLC boot announcement, then read its identity '
             '(SN, article, app name + version). Power-cycle the PLC after '
-            'clicking. Read-only — does not erase or flash.'
+            'clicking. Read-only — does not erase or flash.\n'
+            '\n'
+            'Works on BLANK modules (dropdown: "Boot mode (125 kbit/s)"), '
+            'which sit in the bootloader and announce themselves.\n'
+            '\n'
+            'An already-programmed module runs its firmware and does not '
+            'announce, so Scan cannot see it — that is expected, not a '
+            'fault. Flash it directly; Flash commands the module into the '
+            'bootloader itself and needs no Scan.'
         )
         self._scan_btn.clicked.connect(self._on_scan)
         gh_layout.addWidget(self._scan_btn)
@@ -1106,6 +1106,16 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_check_connection(self) -> None:
+        # Same exclusivity rule as Scan — the flasher owns the adapter while
+        # it runs, so probing would report "no adapter found" and mislead.
+        if self._flashing:
+            QMessageBox.information(
+                self, 'Flash in progress',
+                'A flash is running and it owns the CAN adapter.\n\n'
+                'Wait for it to finish before detecting the adapter.',
+            )
+            return
+
         # Probing PCAN channels while the batch listener holds one makes that
         # channel look busy; release it first (resumed in _on_conn_result).
         self._stop_batch_listener()
@@ -1693,6 +1703,17 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_scan(self) -> None:
+        # Only one process may hold the PCAN channel, and the flasher owns it
+        # for the whole flash. Scanning now would fail with PCAN's opaque
+        # "channel has not been initialized" error.
+        if self._flashing:
+            QMessageBox.information(
+                self, 'Flash in progress',
+                'A flash is running and it owns the CAN adapter.\n\n'
+                'Wait for it to finish (or press Stop) before scanning.',
+            )
+            return
+
         if not self._detected_channel:
             QMessageBox.warning(
                 self, 'No adapter',
@@ -1779,17 +1800,17 @@ class MainWindow(QMainWindow):
         self._append_log('Power-cycle the PLC again before clicking Flash.')
 
     def _on_scan_partial(self, serial: int, msg: str) -> None:
-        """The PLC was detected but its identity couldn't be read (CAN FD).
+        """The PLC was detected but its identity couldn't be read.
         Not a failure — the unit is present and flashable, so we present this
         as an informational outcome and keep Flash ready to go."""
         self._scan_btn.setEnabled(True)
         self._check_conn_btn.setEnabled(True)
         self._flash_btn.setEnabled(True)
-        self._status_label.setText(f'PLC detected — SN {serial} (CAN FD — press Flash)')
+        self._status_label.setText(f'PLC detected — SN {serial} (press Flash)')
         self._append_log(f'PLC DETECTED — SN: {serial}')
         self._append_log(
-            '  Full identity not readable (CAN FD module). This is expected — '
-            'just press Flash; no Scan is needed for these parts.'
+            '  Boot announcement received, but the identity read did not '
+            'complete. The unit is present and flashable — just press Flash.'
         )
         QMessageBox.information(self, 'PLC detected — ready to flash', msg)
 

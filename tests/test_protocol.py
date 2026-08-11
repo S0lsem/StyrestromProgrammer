@@ -164,6 +164,97 @@ class TestScan:
             scan_plc('PCAN_USBBUS1', 125000, timeout=0.05)
         assert not isinstance(excinfo.value, PartialScanError)
 
+    def test_scan_opens_the_bus_the_module_talks_on(self, monkeypatch):
+        """Regression guard: Scan must open the bus at the caller's baud.
+
+        Scan shipped hard-coded to 125k classical, so a *programmed* CAN FD
+        module — which is on 500k:2000k and never appears at 125k — always
+        failed with "no boot announcement". The same bug hit the batch
+        listener independently, so pin the bus config here.
+        """
+        import can
+        seen = {}
+        bus = _FakeBus(self._CANFD_ANNOUNCE, boot_count=0)
+        monkeypatch.setattr(can, 'Bus', lambda **kw: (seen.update(kw), bus)[1])
+
+        with pytest.raises(ScanError):
+            scan_plc('PCAN_USBBUS1', 500000, True, 2_000_000, timeout=0.05)
+
+        assert seen['channel'] == 'PCAN_USBBUS1'
+        # CAN FD must arrive as a BitTimingFd — see test_fd_never_uses_bare_fd_flag.
+        timing = seen['timing']
+        assert timing.nom_bitrate  == 500_000
+        assert timing.data_bitrate == 2_000_000
+
+    def test_scan_classical_uses_plain_bitrate(self, monkeypatch):
+        """Classical CAN opens with a plain bitrate and no FD timing."""
+        import can
+        seen = {}
+        bus = _FakeBus(self._CANFD_ANNOUNCE, boot_count=0)
+        monkeypatch.setattr(can, 'Bus', lambda **kw: (seen.update(kw), bus)[1])
+
+        with pytest.raises(ScanError):
+            scan_plc('PCAN_USBBUS1', 125000, False, 0, timeout=0.05)
+
+        assert seen['bitrate'] == 125000
+        assert seen['fd']      is False
+        assert 'timing' not in seen
+
+
+class TestOpenPcan:
+    """Bus-open contract. python-can's PCAN backend IGNORES bitrate and
+    data_bitrate when fd=True, building the InitializeFD string from f_clock
+    plus eight segment values instead. Passing the bare fd flag therefore
+    sends an empty string and PCANBasic answers "A parameter contains an
+    invalid value" — verified against real hardware. Only BitTimingFd works.
+    """
+
+    def _capture(self, monkeypatch):
+        import can
+        seen = {}
+        monkeypatch.setattr(can, 'Bus', lambda **kw: (seen.update(kw), object())[1])
+        return seen
+
+    def test_fd_never_uses_bare_fd_flag(self, monkeypatch):
+        from mrs_protocol.protocol import open_pcan
+        seen = self._capture(monkeypatch)
+        open_pcan('PCAN_USBBUS1', 500_000, True, 2_000_000)
+
+        assert 'timing' in seen, 'CAN FD must be opened with a BitTimingFd'
+        assert not seen.get('fd'), 'the bare fd flag cannot open a PCAN FD bus'
+        assert 'data_bitrate' not in seen
+
+    def test_fd_timing_matches_requested_bauds(self, monkeypatch):
+        from mrs_protocol.protocol import open_pcan
+        seen = self._capture(monkeypatch)
+        open_pcan('PCAN_USBBUS1', 500_000, True, 2_000_000)
+
+        t = seen['timing']
+        assert t.nom_bitrate  == 500_000
+        assert t.data_bitrate == 2_000_000
+        assert t.f_clock in (80_000_000, 60_000_000, 40_000_000,
+                             30_000_000, 24_000_000, 20_000_000)
+
+    def test_classical_is_untouched(self, monkeypatch):
+        from mrs_protocol.protocol import open_pcan
+        seen = self._capture(monkeypatch)
+        open_pcan('PCAN_USBBUS1', 125_000, False, 0)
+
+        assert seen['bitrate'] == 125_000
+        assert seen['fd'] is False
+        assert 'timing' not in seen
+
+    def test_fd_flag_without_data_bitrate_stays_classical(self, monkeypatch):
+        """can_fd=True but data_bitrate=0 is a classical bus, not a broken
+        FD one — MODULE_TYPES only pairs can_fd with a real data rate."""
+        from mrs_protocol.protocol import open_pcan
+        seen = self._capture(monkeypatch)
+        open_pcan('PCAN_USBBUS1', 500_000, True, 0)
+
+        assert seen['bitrate'] == 500_000
+        assert seen['fd'] is False
+        assert 'timing' not in seen
+
 
 # ---------------------------------------------------------------------------
 # TestTrcParser
