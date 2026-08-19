@@ -25,8 +25,10 @@ On this account that is the home folder itself, `/home/Solsem/` — **not**
 a `mysite/` subfolder. Upload/replace, in this order (the new `flask_app.py`
 needs the new `user_store.py` to already be there):
 - `flask_app.py`
-- `user_store.py`   ← new
-- `manage_users.py` ← new
+- `user_store.py`
+- `manage_users.py`
+- `firmware_mirror.py`   ← keeps a local copy of the firmware, so serving a
+  distributor costs no GitHub API calls
 
 ### 2. Make a token-signing secret
 Open a **Bash console** on PythonAnywhere and run:
@@ -234,3 +236,87 @@ in the window — they do not have to log out first.
 The app only *shows* the menu item based on the flag it received at login; the
 server re-checks it on every single admin call. A tampered client gets an
 empty window and a refusal, not access.
+
+---
+
+## How firmware reaches distributors (and why GitHub is no longer in the way)
+
+**The problem this solves.** The proxy used to call the GitHub API on every
+Refresh and every download. GitHub's limit of 5,000 requests/hour is **per user
+account and shared across every token that account owns** — your release
+script, any CI, any tool holding a token of yours, and distributor downloads
+all drew on one budget. On 2026-08-19 something on the account burned 26,000
+requests in an hour and distributors could not download firmware at all, even
+though the proxy itself was nearly idle.
+
+**How it works now.** The server keeps its own copy of the firmware:
+
+```
+publish firmware to GitHub  ->  you press "Sync firmware from GitHub"  ->  distributors download
+        (as before)                  (~1 + 2 per part, rare)              (zero GitHub calls)
+```
+
+A distributor's Refresh and Download are served entirely from the server's
+copy. GitHub being slow, down, or out of quota no longer affects them.
+
+### The one thing you must remember
+
+**After publishing new firmware to the repo, press "Sync firmware from
+GitHub" in Settings → Manage distributors.** Until you do, distributors keep
+getting the previous version — the server serves its copy, not the repo.
+
+The health line at the bottom of that window always tells you where you stand:
+
+```
+Serving 4 part(s) from the server copy, synced 15 minute(s) ago.
+Distributor downloads cost no GitHub quota.  GitHub quota: 4,986 of 5,000 left.
+```
+
+If it says *"No server copy yet"*, press Sync once and that stops being true.
+If the quota line turns red, something on your GitHub account is eating the
+budget — that affects publishing and syncing, but no longer affects your
+distributors.
+
+### What a sync does
+
+Downloads every `.s19` into a staging folder and swaps it in only once all of
+them succeeded. A sync that fails half way leaves the previous copy completely
+intact — distributors keep working. Parts with no `.s19` are skipped and named
+in a warning rather than failing the whole run.
+
+---
+
+## Giving the proxy its own GitHub identity
+
+Even with the mirror, syncing and publishing still spend quota. Keep them from
+competing by giving the server its own GitHub identity, so **your** usage can
+never starve it.
+
+Create a separate GitHub account — a "machine account", which GitHub
+explicitly permits for automation — used for nothing else:
+
+1. Sign up a new GitHub account, e.g. `styrestrom-proxy`, with a company
+   e-mail alias you control.
+2. On the **firmware** repo (`Code-for-Highbeam-X`) → **Settings** →
+   **Collaborators** → invite that account with **Read** access. Accept the
+   invitation from the new account.
+3. Logged in as the new account, create a fine-grained token:
+   **Settings → Developer settings → Personal access tokens → Fine-grained**
+   - Resource owner: `S0lsem`
+   - Repository access: **Only select repositories** → `Code-for-Highbeam-X`
+   - Repository permissions: **Contents = Read-only**
+   - Expiration: set a calendar reminder to rotate it before it lapses
+4. On PythonAnywhere, **Web** tab → WSGI configuration file, change:
+   ```python
+   os.environ['GITHUB_TOKEN'] = 'the-new-machine-account-token'
+   ```
+   Save, then **Reload**.
+5. Check it worked: open **Manage distributors** and press **Sync firmware
+   from GitHub**. If parts appear, the new identity can read the repo.
+
+That account now has its own 5,000/hour, used only for syncing. Your personal
+token keeps its own budget for releases. Nothing you do can take firmware
+delivery down.
+
+**Keep `.github_token` (releases) and `GITHUB_TOKEN` (proxy) separate.** Same
+value in both would put you straight back where you started.

@@ -23,3 +23,7 @@ flash_log.csv
 # Server-side account store + local DB — never commit (lives on the proxy)
 server/users.json
 server/events.db
+
+# Server-side firmware mirror (created at runtime on the server)
+server/firmware_mirror/
+server/firmware_mirror.old/

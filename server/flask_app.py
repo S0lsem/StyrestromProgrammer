@@ -68,6 +68,7 @@ from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, request, abort, Response
 
+import firmware_mirror
 import user_store
 
 app = Flask(__name__)
@@ -281,6 +282,10 @@ def list_parts():
     client would hide.
     """
     _, user = _require_auth()
+    # The mirror is the normal path and costs no GitHub calls at all. Falling
+    # back to a live listing only matters before the first sync.
+    if firmware_mirror.is_populated():
+        return jsonify(user_store.filter_parts(user, firmware_mirror.list_parts()))
     try:
         items = _github_get(FIRMWARE_PATH)
         parts = sorted(
@@ -311,6 +316,10 @@ def get_firmware(part: str):
             'error': f"'{part}' is not enabled for your account. "
                      f'Contact Styrestrøm to have it added.',
         }), 403
+    mirrored = firmware_mirror.read_s19(part)
+    if mirrored is not None:
+        return Response(mirrored, mimetype='text/plain; charset=us-ascii')
+
     try:
         located = _find_s19(part)
         if located is None:
@@ -369,6 +378,8 @@ def admin_list_users():
 def admin_list_all_parts():
     """The full firmware catalogue, unfiltered — the admin picks from this."""
     _require_admin()
+    if firmware_mirror.is_populated():
+        return jsonify(firmware_mirror.list_parts())
     try:
         items = _github_get(FIRMWARE_PATH)
         return jsonify(sorted(
@@ -459,6 +470,59 @@ def admin_delete_user(username: str):
     if not user_store.delete_user(target):
         return jsonify({'error': f"No such account: '{username}'."}), 404
     return jsonify({'deleted': target})
+
+
+@app.route('/admin/sync', methods=['POST'])
+def admin_sync():
+    """Copy every .s19 from the firmware repo into the local mirror.
+
+    This is the only routine operation that spends GitHub quota (~1 + 2 per
+    part). Everything a distributor does is served from the result.
+    """
+    _require_admin()
+    try:
+        result = firmware_mirror.sync(
+            list_dir=lambda sub: _github_get(
+                FIRMWARE_PATH + (f'/{sub}' if sub else '')
+            ),
+            get_file=lambda path: _github_get(f'{FIRMWARE_PATH}/{path}'),
+        )
+    except HTTPError as exc:
+        return jsonify({'error': _github_error(exc)}), 502
+    except URLError as exc:
+        return jsonify({'error': f'Network error: {exc.reason}'}), 502
+    except OSError as exc:
+        return jsonify({'error': f'Could not write the mirror: {exc}'}), 500
+    return jsonify(result)
+
+
+@app.route('/admin/status', methods=['GET'])
+def admin_status():
+    """Mirror state plus the GitHub budget, so HQ can see trouble coming.
+
+    The /rate_limit endpoint is itself exempt from rate limiting, so asking
+    costs nothing.
+    """
+    _require_admin()
+    quota = {'available': False}
+    try:
+        req = Request(f'{_API}/rate_limit', headers={
+            'Authorization': f'Bearer {GITHUB_TOKEN}',
+            'Accept': 'application/vnd.github.v3+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+        })
+        with urlopen(req, timeout=10) as resp:
+            core = json.loads(resp.read()).get('resources', {}).get('core', {})
+        quota = {
+            'available': True,
+            'limit':     int(core.get('limit', 0)),
+            'remaining': int(core.get('remaining', 0)),
+            'used':      int(core.get('used', 0)),
+            'reset':     int(core.get('reset', 0)),
+        }
+    except (HTTPError, URLError, ValueError, KeyError):
+        pass                    # a missing quota reading must not break the window
+    return jsonify({'mirror': firmware_mirror.status(), 'github': quota})
 
 
 @app.route('/health', methods=['GET'])

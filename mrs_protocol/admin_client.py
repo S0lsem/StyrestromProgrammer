@@ -88,6 +88,22 @@ def list_all_parts() -> list[str]:
     return result if isinstance(result, list) else []
 
 
+def server_status() -> dict:
+    """Mirror state + GitHub quota, for the health line in the admin window."""
+    result = _request('GET', '/admin/status')
+    return result if isinstance(result, dict) else {}
+
+
+def sync_firmware() -> dict:
+    """Copy every .s19 from the firmware repo into the server's mirror.
+
+    The one routine operation that spends GitHub quota. Everything a
+    distributor does is then served from the mirror at no API cost.
+    """
+    result = _request('POST', '/admin/sync', {})
+    return result if isinstance(result, dict) else {}
+
+
 def create_or_reset_user(username: str, password: str, distributor: str,
                          parts: list | None = None,
                          admin: bool | None = None) -> dict:

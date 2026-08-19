@@ -499,12 +499,21 @@ class _DistributorAdminDialog(QDialog):
         self._delete_btn.clicked.connect(self._on_delete)
         self._reload_btn = QPushButton('Reload')
         self._reload_btn.clicked.connect(self._reload_everything)
+        self._sync_btn = QPushButton('Sync firmware from GitHub…')
+        self._sync_btn.setToolTip(
+            'Copy the newest .s19 files from the firmware repo onto the '
+            'server. Do this after publishing new firmware — distributors '
+            'are served from the server copy, so until you sync they keep '
+            'getting the previous version.'
+        )
+        self._sync_btn.clicked.connect(self._on_sync)
 
         btn_row = QHBoxLayout()
         for b in (self._new_btn, self._pw_btn, self._active_btn,
                   self._admin_btn, self._delete_btn):
             btn_row.addWidget(b)
         btn_row.addStretch(1)
+        btn_row.addWidget(self._sync_btn)
         btn_row.addWidget(self._reload_btn)
 
         left = QVBoxLayout()
@@ -551,6 +560,13 @@ class _DistributorAdminDialog(QDialog):
         self._status.setWordWrap(True)
         self._status.setStyleSheet('color: #555; font-size: 11px;')
 
+        # Server health: where firmware is served from, and how much GitHub
+        # budget is left. Had this been visible on 2026-08-19, the quota
+        # problem would have been obvious instead of surfacing as a bare 403.
+        self._health = QLabel('')
+        self._health.setWordWrap(True)
+        self._health.setStyleSheet('color: #555; font-size: 11px;')
+
         close_btn = QPushButton('Close')
         close_btn.clicked.connect(self.accept)
         foot = QHBoxLayout()
@@ -559,6 +575,7 @@ class _DistributorAdminDialog(QDialog):
 
         root = QVBoxLayout(self)
         root.addLayout(body, 1)
+        root.addWidget(self._health)
         root.addLayout(foot)
 
         self._reload_everything()
@@ -614,7 +631,7 @@ class _DistributorAdminDialog(QDialog):
     def _set_busy(self, busy: bool, message: str) -> None:
         for w in (self._table, self._new_btn, self._pw_btn, self._active_btn,
                   self._admin_btn, self._delete_btn, self._reload_btn,
-                  self._parts_box):
+                  self._sync_btn, self._parts_box):
             w.setEnabled(not busy)
         if message:
             self._status.setText(message)
@@ -644,6 +661,46 @@ class _DistributorAdminDialog(QDialog):
         self._catalogue = list(parts)
         self._catalogue_state = 'ok'
         self._on_selection_changed()
+        self._refresh_health()
+
+    def _refresh_health(self) -> None:
+        """Health is informational — a failure here must never block the window."""
+        self._run(
+            admin_client.server_status,
+            self._on_status_loaded,
+            'Checking server…',
+            on_fail=lambda msg: self._health.setText('Server status unavailable.'),
+        )
+
+    def _on_status_loaded(self, status) -> None:
+        mirror = (status or {}).get('mirror') or {}
+        github = (status or {}).get('github') or {}
+
+        if mirror.get('populated'):
+            served = (
+                f"Serving {mirror.get('part_count', 0)} part(s) from the server "
+                f"copy, synced {_ago(mirror.get('synced_at', 0))}. Distributor "
+                f'downloads cost no GitHub quota.'
+            )
+        else:
+            served = (
+                'No server copy yet — every download is fetched live from GitHub '
+                'and spends quota. Press "Sync firmware from GitHub" to fix that.'
+            )
+
+        quota = ''
+        colour = '#555'
+        if github.get('available'):
+            remaining = github.get('remaining', 0)
+            limit = github.get('limit', 0) or 1
+            quota = f'  GitHub quota: {remaining:,} of {limit:,} left.'
+            if remaining == 0:
+                quota += ' EXHAUSTED — publishing and syncing will fail.'
+                colour = '#c22'
+            elif remaining < limit * 0.2:
+                colour = '#a60'
+        self._health.setStyleSheet(f'color: {colour}; font-size: 11px;')
+        self._health.setText(served + quota)
 
     def _on_catalogue_failed(self, message: str) -> None:
         """GitHub is unreachable. Accounts still work, and so do All / none —
@@ -924,12 +981,63 @@ class _DistributorAdminDialog(QDialog):
             f'Deleting {name}…',
         )
 
+    def _on_sync(self) -> None:
+        confirm = QMessageBox.question(
+            self, 'Sync firmware',
+            'Copy the newest firmware from GitHub onto the server? '
+            'Distributors are served from that copy.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._run(
+            admin_client.sync_firmware,
+            self._on_sync_done,
+            'Syncing firmware from GitHub — this can take a moment…',
+        )
+
+    def _on_sync_done(self, result) -> None:
+        parts = (result or {}).get('parts') or []
+        skipped = (result or {}).get('skipped') or []
+        self._catalogue_state = 'pending'
+        self._maybe_load_catalogue()
+        if skipped:
+            detail = '; '.join(
+                f"{s.get('part')} ({s.get('reason')})" for s in skipped
+            )
+            QMessageBox.warning(
+                self, 'Sync finished with skips',
+                f'Copied {len(parts)} part(s). Skipped: {detail}'
+            )
+        self._status.setText(
+            f'Synced {len(parts)} part(s) to the server. Distributors get these '
+            f'on their next Refresh.'
+        )
+
     def _after_change(self, message: str) -> None:
         self._run(admin_client.list_users, self._on_users_loaded, message)
 
     def closeEvent(self, event) -> None:      # noqa: N802 — Qt naming
         self._finish_thread()
         super().closeEvent(event)
+
+
+def _ago(unix_seconds: int) -> str:
+    """'12 minute(s) ago' — deliberately vague; the exact second never matters."""
+    import time as _time
+    if not unix_seconds:
+        return 'never'
+    seconds = max(0, int(_time.time()) - int(unix_seconds))
+    if seconds < 90:
+        return 'just now'
+    minutes = seconds // 60
+    if minutes < 90:
+        return f'{minutes} minute(s) ago'
+    hours = minutes // 60
+    if hours < 48:
+        return f'{hours} hour(s) ago'
+    return f'{hours // 24} day(s) ago'
 
 
 def _matches_any(part: str, patterns) -> bool:
