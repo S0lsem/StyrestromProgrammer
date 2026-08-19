@@ -62,6 +62,7 @@ import base64
 import json
 import os
 import re
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -87,6 +88,66 @@ LOGIN_ENFORCED = os.environ.get('LOGIN_ENFORCED', '1').strip().lower() \
     not in ('0', 'false', 'no', '')
 
 _API = 'https://api.github.com'
+
+# ---------------------------------------------------------------------------
+# GitHub response cache
+#
+# Every /parts click cost one GitHub call and every download two or three, so
+# a burst of activity — or anything else on the account eating the shared
+# 5,000/hour user budget — took firmware delivery down completely. Cache what
+# GitHub returns, and on a rate-limit refusal keep serving the last good copy
+# rather than failing: stale firmware metadata beats no firmware at all.
+# ---------------------------------------------------------------------------
+CACHE_TTL_SECONDS = int(os.environ.get('GITHUB_CACHE_TTL', 300))
+# Don't let a huge file sit in the free tier's memory forever.
+_CACHE_MAX_BYTES = 8 * 1024 * 1024
+_cache: dict = {}          # path -> (fetched_at, payload, approx_size)
+
+
+def _cache_get(path: str, max_age: float):
+    entry = _cache.get(path)
+    if entry is None:
+        return None
+    fetched_at, payload, _ = entry
+    if max_age is not None and (time.time() - fetched_at) > max_age:
+        return None
+    return payload
+
+
+def _cache_put(path: str, payload) -> None:
+    size = len(json.dumps(payload)) if payload is not None else 0
+    if size <= _CACHE_MAX_BYTES:
+        _cache[path] = (time.time(), payload, size)
+
+
+def _is_rate_limited(exc: HTTPError) -> bool:
+    """True when GitHub refused because the hourly budget is spent.
+
+    GitHub answers 403 both for 'no permission' and for 'rate limit exceeded',
+    so the remaining-count header is what separates them.
+    """
+    if exc.code not in (403, 429):
+        return False
+    remaining = exc.headers.get('x-ratelimit-remaining') if exc.headers else None
+    return remaining is None or remaining == '0'
+
+
+def _github_error(exc: HTTPError) -> str:
+    """Plain-language reason, so the operator is not left staring at '403'."""
+    if not _is_rate_limited(exc):
+        return f'GitHub API error: {exc.code}'
+    reset = (exc.headers or {}).get('x-ratelimit-reset')
+    when = ''
+    if reset:
+        try:
+            when = time.strftime(' Try again after %H:%M UTC.',
+                                 time.gmtime(int(reset)))
+        except (TypeError, ValueError):
+            when = ''
+    return (
+        'The firmware server has used up its hourly GitHub quota, so the '
+        'part list is temporarily unavailable.' + when
+    )
 
 
 def _check_api_key():
@@ -129,14 +190,32 @@ def _require_auth() -> tuple[str, dict | None]:
 
 
 def _github_get(path: str):
+    """Fetch a repo path, preferring a fresh cache entry.
+
+    A 404 is passed straight through — callers rely on it to probe for an
+    optional src/ folder. A rate-limit refusal falls back to the last good
+    copy of *this* path if we have one, however old.
+    """
+    cached = _cache_get(path, CACHE_TTL_SECONDS)
+    if cached is not None:
+        return cached
+
     url = f'{_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}'
     req = Request(url, headers={
         'Authorization': f'Bearer {GITHUB_TOKEN}',
         'Accept': 'application/vnd.github.v3+json',
         'X-GitHub-Api-Version': '2022-11-28',
     })
-    with urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read())
+    try:
+        with urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read())
+    except HTTPError as exc:
+        stale = _cache_get(path, None) if _is_rate_limited(exc) else None
+        if stale is not None:
+            return stale
+        raise
+    _cache_put(path, payload)
+    return payload
 
 
 def _find_s19(part: str) -> tuple[str, str] | None:
@@ -211,7 +290,7 @@ def list_parts():
         )
         return jsonify(user_store.filter_parts(user, parts))
     except HTTPError as exc:
-        return jsonify({'error': f'GitHub API error: {exc.code}'}), 502
+        return jsonify({'error': _github_error(exc)}), 502
     except URLError as exc:
         return jsonify({'error': f'Network error: {exc.reason}'}), 502
 
@@ -242,7 +321,7 @@ def get_firmware(part: str):
         s19_text = base64.b64decode(content_b64).decode('ascii', errors='strict')
         return Response(s19_text, mimetype='text/plain; charset=us-ascii')
     except HTTPError as exc:
-        return jsonify({'error': f'GitHub API error: {exc.code}'}), 502
+        return jsonify({'error': _github_error(exc)}), 502
     except URLError as exc:
         return jsonify({'error': f'Network error: {exc.reason}'}), 502
 
@@ -298,7 +377,7 @@ def admin_list_all_parts():
             if item['type'] == 'dir' and not item['name'].startswith('.')
         ))
     except HTTPError as exc:
-        return jsonify({'error': f'GitHub API error: {exc.code}'}), 502
+        return jsonify({'error': _github_error(exc)}), 502
     except URLError as exc:
         return jsonify({'error': f'Network error: {exc.reason}'}), 502
 

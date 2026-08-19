@@ -463,6 +463,9 @@ class _DistributorAdminDialog(QDialog):
         self._me         = current_username.strip().lower()
         self._users      = []
         self._catalogue  = []
+        # 'pending' -> not fetched yet, 'ok' -> have it, 'failed' -> GitHub
+        # refused. Tracked so a dead catalogue is not retried on every save.
+        self._catalogue_state = 'pending'
         self._thread     = None
         self._worker     = None
 
@@ -564,7 +567,9 @@ class _DistributorAdminDialog(QDialog):
     # Threading helper — one call in flight at a time
     # ------------------------------------------------------------------
 
-    def _run(self, fn, on_ok, busy_message: str) -> None:
+    def _run(self, fn, on_ok, busy_message: str, on_fail=None) -> None:
+        """*on_fail* makes a failure non-fatal: it is called instead of the
+        pop-up, so an optional step cannot take the whole window down."""
         if self._thread is not None:
             return
         self._set_busy(True, busy_message)
@@ -573,7 +578,7 @@ class _DistributorAdminDialog(QDialog):
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.ok.connect(lambda result: self._finish(on_ok, result))
-        self._worker.fail.connect(self._on_fail)
+        self._worker.fail.connect(lambda msg: self._fail(on_fail, msg))
         self._worker.auth_required.connect(self._on_auth_required)
         self._thread.start()
 
@@ -589,10 +594,13 @@ class _DistributorAdminDialog(QDialog):
         self._set_busy(False, '')
         on_ok(result)
 
-    def _on_fail(self, message: str) -> None:
+    def _fail(self, on_fail, message: str) -> None:
         self._finish_thread()
         self._set_busy(False, message)
-        QMessageBox.warning(self, 'Could not save', message)
+        if on_fail is None:
+            QMessageBox.warning(self, 'Could not save', message)
+        else:
+            on_fail(message)
 
     def _on_auth_required(self) -> None:
         self._finish_thread()
@@ -616,17 +624,37 @@ class _DistributorAdminDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _reload_everything(self) -> None:
-        """Catalogue first, then accounts — the picker needs the full part list
-        before it can show anybody's ticks."""
+        """Accounts first. They come from the server's own account file, so
+        they must stay listable even when GitHub is unreachable — the part
+        catalogue is a second, optional step."""
+        self._catalogue_state = 'pending'
+        self._run(admin_client.list_users, self._on_users_loaded, 'Loading accounts…')
+
+    def _maybe_load_catalogue(self) -> None:
+        if self._catalogue_state != 'pending':
+            return
         self._run(
             admin_client.list_all_parts,
             self._on_catalogue_loaded,
             'Loading firmware catalogue…',
+            on_fail=self._on_catalogue_failed,
         )
 
     def _on_catalogue_loaded(self, parts) -> None:
         self._catalogue = list(parts)
-        self._run(admin_client.list_users, self._on_users_loaded, 'Loading accounts…')
+        self._catalogue_state = 'ok'
+        self._on_selection_changed()
+
+    def _on_catalogue_failed(self, message: str) -> None:
+        """GitHub is unreachable. Accounts still work, and so do All / none —
+        only the part-by-part ticks need the catalogue."""
+        self._catalogue = []
+        self._catalogue_state = 'failed'
+        self._catalogue_error = message
+        self._on_selection_changed()
+        self._status.setText(
+            'Accounts loaded. Part list unavailable: ' + message
+        )
 
     def _on_users_loaded(self, users) -> None:
         self._users = list(users)
@@ -659,6 +687,7 @@ class _DistributorAdminDialog(QDialog):
             f'{len(self._users)} account(s). Changes reach a distributor the next '
             f'time they click Refresh list — they do not have to log in again.'
         )
+        self._maybe_load_catalogue()
 
     def _describe_parts(self, user) -> str:
         parts = user.get('parts') or []
@@ -736,6 +765,15 @@ class _DistributorAdminDialog(QDialog):
         # A list set from the console may hold wildcards, or names for parts
         # that are no longer in the repo. Ticking boxes here would rewrite
         # those into plain names, so say so rather than silently doing it.
+        if self._catalogue_state == 'failed':
+            self._parts_note.setText(
+                'Could not read the part list: ' + getattr(self, '_catalogue_error', '')
+                + ' You can still grant All firmware or clear it entirely; '
+                'ticking individual parts needs the list. Press Reload to retry.'
+            )
+            self._parts_note.setVisible(True)
+            return
+
         loose = [p for p in parts if p != self._ALL and p not in self._catalogue]
         if loose:
             self._parts_note.setText(
