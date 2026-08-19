@@ -12,12 +12,14 @@ Web App writing into an HQ-owned Google Sheet.
 Setup on PythonAnywhere:
   1. Create a free account at pythonanywhere.com
   2. Go to "Web" tab → "Add a new web app" → Manual configuration → Python 3.10
-  3. Go to "Files" tab → open /home/yourusername/mysite/flask_app.py
+  3. Go to "Files" tab → open /home/<yourusername>/flask_app.py (these three
+     files live wherever your WSGI file points; on the Styrestrom account
+     that is the home folder itself, not a mysite/ subfolder)
   4. Paste this file's contents and save
   5. Go to "Web" tab → open the WSGI configuration file
   6. Replace its contents with:
        import sys
-       sys.path.insert(0, '/home/yourusername/mysite')
+       sys.path.insert(0, '/home/<yourusername>')
        from flask_app import app as application
   7. Go to "Web" tab → click "Reload"
   8. Set environment variables (see below)

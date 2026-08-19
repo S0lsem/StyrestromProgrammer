@@ -47,7 +47,7 @@ import secrets
 import time
 
 # Path to the users file. Override with the USERS_FILE env var (e.g. to point
-# at /home/<you>/mysite/users.json on PythonAnywhere).
+# at /home/<you>/users.json on PythonAnywhere).
 USERS_FILE = os.environ.get(
     'USERS_FILE', os.path.join(os.path.dirname(__file__), 'users.json')
 )

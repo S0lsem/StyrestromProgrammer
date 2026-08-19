@@ -20,8 +20,10 @@ The trick: deploy with enforcement **off** so old apps keep working, get
 everyone updated to the login-enabled app, then flip enforcement **on**.
 
 ### 1. Upload the three server files to PythonAnywhere
-On the **Files** tab, in your `mysite/` folder (next to the existing
-`flask_app.py`), upload/replace:
+On the **Files** tab, open the folder that already holds `flask_app.py`.
+On this account that is the home folder itself, `/home/Solsem/` — **not**
+a `mysite/` subfolder. Upload/replace, in this order (the new `flask_app.py`
+needs the new `user_store.py` to already be there):
 - `flask_app.py`
 - `user_store.py`   ← new
 - `manage_users.py` ← new
@@ -49,7 +51,7 @@ At this point: old apps still work (via the API key), and login also works.
 ### 4. Create the distributor accounts
 In a Bash console:
 ```bash
-cd ~/mysite
+cd ~          # the folder holding flask_app.py
 python3 manage_users.py add acme "Acme Norway AS"
 # it prompts for a password (twice); nothing is echoed
 python3 manage_users.py list          # see all accounts
@@ -108,7 +110,7 @@ You only need a PythonAnywhere console **once**, to make your own account an
 admin:
 
 ```bash
-cd ~/mysite
+cd ~          # the folder holding flask_app.py
 python3 manage_users.py admin <your-username>
 ```
 
@@ -153,10 +155,11 @@ entitled to never travels over the wire at all, not even as a name.
 
 ### The three commands
 
-Run these in a Bash console on PythonAnywhere, in `~/mysite`:
+Run these in a Bash console on PythonAnywhere, in the folder holding
+`flask_app.py` (`cd ~` on this account):
 
 ```bash
-cd ~/mysite
+cd ~          # the folder holding flask_app.py
 
 # Only these parts (replace with the real folder names):
 python3 manage_users.py parts acme "1493X-V4" "14930 Taxi"
