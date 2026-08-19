@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from .auth import AuthenticationError, get_token
@@ -107,21 +108,30 @@ def create_or_reset_user(username: str, password: str, distributor: str,
     return _request('POST', '/admin/users', payload)
 
 
+def _user_path(username: str) -> str:
+    """Account URL for *username*.
+
+    Logins are often e-mail addresses, so the name must be percent-encoded —
+    an unescaped '@' or '+' would address a different account, or none.
+    """
+    return '/admin/users/' + quote(username, safe='')
+
+
 def set_parts(username: str, parts: list) -> dict:
     """Replace which firmware *username* may see and download."""
-    return _request('PATCH', f'/admin/users/{username}', {'parts': list(parts)})
+    return _request('PATCH', _user_path(username), {'parts': list(parts)})
 
 
 def set_active(username: str, active: bool) -> dict:
     """Enable or disable an account. Takes effect on their next request."""
-    return _request('PATCH', f'/admin/users/{username}', {'active': bool(active)})
+    return _request('PATCH', _user_path(username), {'active': bool(active)})
 
 
 def set_admin(username: str, admin: bool) -> dict:
     """Grant or revoke HQ admin rights."""
-    return _request('PATCH', f'/admin/users/{username}', {'admin': bool(admin)})
+    return _request('PATCH', _user_path(username), {'admin': bool(admin)})
 
 
 def delete_user(username: str) -> dict:
     """Remove an account entirely."""
-    return _request('DELETE', f'/admin/users/{username}')
+    return _request('DELETE', _user_path(username))

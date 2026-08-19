@@ -61,6 +61,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -266,6 +267,16 @@ def _json_body() -> dict:
     return request.get_json(silent=True) or {}
 
 
+# Distributor logins are often e-mail addresses, so '.', '@' and '+' have to be
+# legal. Everything else is rejected: a username ends up in a URL path, so a
+# slash or whitespace would silently address the wrong account.
+_USERNAME_RE = re.compile(r'^[a-z0-9._+@-]{1,64}$')
+
+
+def _valid_username(username: str) -> bool:
+    return bool(_USERNAME_RE.match(username))
+
+
 @app.route('/admin/users', methods=['GET'])
 def admin_list_users():
     _require_admin()
@@ -305,8 +316,11 @@ def admin_upsert_user():
     password    = str(data.get('password', ''))
     distributor = str(data.get('distributor', '')).strip()
 
-    if not username or not username.replace('-', '').replace('_', '').isalnum():
-        return jsonify({'error': 'Username must be letters, digits, - or _.'}), 400
+    if not _valid_username(username):
+        return jsonify({
+            'error': 'Username may use letters, digits and . _ - + @ '
+                     '(an e-mail address is fine), with no spaces.',
+        }), 400
     if len(password) < 8:
         return jsonify({'error': 'Password must be at least 8 characters.'}), 400
     if not distributor:
