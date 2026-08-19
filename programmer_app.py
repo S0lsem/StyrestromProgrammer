@@ -27,8 +27,11 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -36,15 +39,18 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from types import SimpleNamespace
+import fnmatch
 import re
 
-from mrs_protocol import event_logger
+from mrs_protocol import admin_client, event_logger
 
 
 _VERSION_NUMBER_RE = re.compile(r'\d+\.\d+(?:\.\d+)?')
@@ -340,6 +346,562 @@ class _LoginDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+# Distributor administration (HQ accounts only)
+# ---------------------------------------------------------------------------
+
+class _AdminCallWorker(QObject):
+    """Runs one admin API call off the GUI thread so the window never freezes."""
+    ok            = pyqtSignal(object)
+    fail          = pyqtSignal(str)
+    auth_required = pyqtSignal()
+
+    def __init__(self, fn) -> None:
+        super().__init__()
+        self._fn = fn
+
+    def run(self) -> None:
+        from mrs_protocol.auth import AuthenticationError
+        try:
+            self.ok.emit(self._fn())
+        except AuthenticationError:
+            self.auth_required.emit()
+        except Exception as exc:            # noqa: BLE001 — shown to the admin
+            self.fail.emit(str(exc))
+
+
+class _AccountDialog(QDialog):
+    """Create an account, or reset an existing one's password.
+
+    Reset mode locks the username so a typo cannot silently create a second
+    account instead of resetting the one you meant.
+    """
+
+    def __init__(self, parent, username: str = '', distributor: str = '') -> None:
+        super().__init__(parent)
+        self._reset_mode = bool(username)
+        self.setWindowTitle(
+            f'Reset password — {username}' if self._reset_mode
+            else 'New distributor account'
+        )
+        self.setMinimumWidth(380)
+
+        self._user_edit = QLineEdit(username)
+        self._user_edit.setPlaceholderText('short login name, e.g. acme')
+        self._user_edit.setEnabled(not self._reset_mode)
+        self._dist_edit = QLineEdit(distributor)
+        self._dist_edit.setPlaceholderText('company name, e.g. Acme Norway AS')
+        self._pw_edit = QLineEdit()
+        self._pw_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._pw2_edit = QLineEdit()
+        self._pw2_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._pw2_edit.returnPressed.connect(self._on_ok)
+
+        form = QFormLayout()
+        form.addRow('Username:', self._user_edit)
+        form.addRow('Distributor:', self._dist_edit)
+        form.addRow('Password:', self._pw_edit)
+        form.addRow('Repeat password:', self._pw2_edit)
+
+        self._status = QLabel(
+            'The new password works immediately — tell them before you save.'
+            if self._reset_mode else
+            'They log in with this username and password. A new account starts '
+            'with NO firmware; tick what they need once it appears in the list.'
+        )
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet('color: #555; font-size: 11px;')
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_ok)
+        buttons.rejected.connect(self.reject)
+
+        root = QVBoxLayout(self)
+        root.addLayout(form)
+        root.addWidget(self._status)
+        root.addWidget(buttons)
+
+    def _on_ok(self) -> None:
+        if not self._user_edit.text().strip():
+            self._status.setText('Enter a username.')
+            return
+        if not self._dist_edit.text().strip():
+            self._status.setText('Enter the distributor (company) name.')
+            return
+        if len(self._pw_edit.text()) < 8:
+            self._status.setText('Password must be at least 8 characters.')
+            return
+        if self._pw_edit.text() != self._pw2_edit.text():
+            self._status.setText('The two passwords do not match.')
+            self._pw2_edit.selectAll()
+            self._pw2_edit.setFocus()
+            return
+        self.accept()
+
+    def values(self) -> tuple:
+        return (
+            self._user_edit.text().strip().lower(),
+            self._dist_edit.text().strip(),
+            self._pw_edit.text(),
+        )
+
+
+class _DistributorAdminDialog(QDialog):
+    """HQ-only window — accounts on the left, the selected account's firmware
+    on the right. Every change goes straight to the proxy and reaches the
+    distributor the next time they click Refresh list.
+    """
+
+    _ALL = '*'      # the allow-list entry meaning "everything, including future parts"
+
+    def __init__(self, parent, current_username: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle('Distributors — firmware access')
+        self.resize(920, 560)
+        self._me         = current_username.strip().lower()
+        self._users      = []
+        self._catalogue  = []
+        self._thread     = None
+        self._worker     = None
+
+        # ── Accounts table ────────────────────────────────────────────
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(
+            ['Account', 'Distributor', 'Status', 'Firmware']
+        )
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self._table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self._table.itemSelectionChanged.connect(self._on_selection_changed)
+
+        self._new_btn = QPushButton('New distributor…')
+        self._new_btn.clicked.connect(self._on_new_account)
+        self._pw_btn = QPushButton('Reset password…')
+        self._pw_btn.clicked.connect(self._on_reset_password)
+        self._active_btn = QPushButton('Disable')
+        self._active_btn.clicked.connect(self._on_toggle_active)
+        self._admin_btn = QPushButton('Make HQ admin')
+        self._admin_btn.clicked.connect(self._on_toggle_admin)
+        self._delete_btn = QPushButton('Delete…')
+        self._delete_btn.clicked.connect(self._on_delete)
+        self._reload_btn = QPushButton('Reload')
+        self._reload_btn.clicked.connect(self._reload_everything)
+
+        btn_row = QHBoxLayout()
+        for b in (self._new_btn, self._pw_btn, self._active_btn,
+                  self._admin_btn, self._delete_btn):
+            btn_row.addWidget(b)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self._reload_btn)
+
+        left = QVBoxLayout()
+        left.addWidget(self._table, 1)
+        left.addLayout(btn_row)
+
+        # ── Firmware picker ───────────────────────────────────────────
+        self._parts_box = QGroupBox('Firmware for —')
+        parts_layout = QVBoxLayout(self._parts_box)
+
+        self._all_check = QCheckBox('All firmware (including parts added later)')
+        self._all_check.setToolTip(
+            'Give this distributor everything in the repo, now and in future. '
+            'Untick to choose part by part.'
+        )
+        self._all_check.toggled.connect(self._on_all_toggled)
+        parts_layout.addWidget(self._all_check)
+
+        self._parts_list = QListWidget()
+        self._parts_list.setToolTip(
+            'Tick the parts this distributor may see in their Part dropdown and '
+            'download. Anything unticked is invisible to them.'
+        )
+        parts_layout.addWidget(self._parts_list, 1)
+
+        self._parts_note = QLabel('')
+        self._parts_note.setWordWrap(True)
+        self._parts_note.setStyleSheet('color: #a60; font-size: 11px;')
+        self._parts_note.setVisible(False)
+        parts_layout.addWidget(self._parts_note)
+
+        self._save_btn = QPushButton('Save firmware access')
+        self._save_btn.clicked.connect(self._on_save_parts)
+        save_row = QHBoxLayout()
+        save_row.addStretch(1)
+        save_row.addWidget(self._save_btn)
+        parts_layout.addLayout(save_row)
+
+        body = QHBoxLayout()
+        body.addLayout(left, 3)
+        body.addWidget(self._parts_box, 2)
+
+        self._status = QLabel('Loading…')
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet('color: #555; font-size: 11px;')
+
+        close_btn = QPushButton('Close')
+        close_btn.clicked.connect(self.accept)
+        foot = QHBoxLayout()
+        foot.addWidget(self._status, 1)
+        foot.addWidget(close_btn)
+
+        root = QVBoxLayout(self)
+        root.addLayout(body, 1)
+        root.addLayout(foot)
+
+        self._reload_everything()
+
+    # ------------------------------------------------------------------
+    # Threading helper — one call in flight at a time
+    # ------------------------------------------------------------------
+
+    def _run(self, fn, on_ok, busy_message: str) -> None:
+        if self._thread is not None:
+            return
+        self._set_busy(True, busy_message)
+        self._worker = _AdminCallWorker(fn)
+        self._thread = QThread(self)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.ok.connect(lambda result: self._finish(on_ok, result))
+        self._worker.fail.connect(self._on_fail)
+        self._worker.auth_required.connect(self._on_auth_required)
+        self._thread.start()
+
+    def _finish_thread(self) -> None:
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait(3000)
+            self._thread = None
+            self._worker = None
+
+    def _finish(self, on_ok, result) -> None:
+        self._finish_thread()
+        self._set_busy(False, '')
+        on_ok(result)
+
+    def _on_fail(self, message: str) -> None:
+        self._finish_thread()
+        self._set_busy(False, message)
+        QMessageBox.warning(self, 'Could not save', message)
+
+    def _on_auth_required(self) -> None:
+        self._finish_thread()
+        self._set_busy(False, 'Login expired — close this window and log in again.')
+        QMessageBox.warning(
+            self, 'Login expired',
+            'Your login expired, or your admin rights were removed. Close this '
+            'window and log in again.'
+        )
+
+    def _set_busy(self, busy: bool, message: str) -> None:
+        for w in (self._table, self._new_btn, self._pw_btn, self._active_btn,
+                  self._admin_btn, self._delete_btn, self._reload_btn,
+                  self._parts_box):
+            w.setEnabled(not busy)
+        if message:
+            self._status.setText(message)
+
+    # ------------------------------------------------------------------
+    # Loading
+    # ------------------------------------------------------------------
+
+    def _reload_everything(self) -> None:
+        """Catalogue first, then accounts — the picker needs the full part list
+        before it can show anybody's ticks."""
+        self._run(
+            admin_client.list_all_parts,
+            self._on_catalogue_loaded,
+            'Loading firmware catalogue…',
+        )
+
+    def _on_catalogue_loaded(self, parts) -> None:
+        self._catalogue = list(parts)
+        self._run(admin_client.list_users, self._on_users_loaded, 'Loading accounts…')
+
+    def _on_users_loaded(self, users) -> None:
+        self._users = list(users)
+        remembered = self._selected_username()
+        self._table.blockSignals(True)
+        self._table.setRowCount(0)
+        for user in self._users:
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+            name = user.get('username', '')
+            label = f'{name} (you)' if name == self._me else name
+            if user.get('admin'):
+                label += '  [HQ admin]'
+            cells = [
+                label,
+                user.get('distributor', ''),
+                'active' if user.get('active') else 'DISABLED',
+                self._describe_parts(user),
+            ]
+            for column, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if not user.get('active'):
+                    item.setForeground(Qt.GlobalColor.darkGray)
+                self._table.setItem(row, column, item)
+        self._table.resizeColumnToContents(0)
+        self._table.resizeColumnToContents(2)
+        self._table.blockSignals(False)
+        self._select_username(remembered)
+        self._status.setText(
+            f'{len(self._users)} account(s). Changes reach a distributor the next '
+            f'time they click Refresh list — they do not have to log in again.'
+        )
+
+    def _describe_parts(self, user) -> str:
+        parts = user.get('parts') or []
+        if self._ALL in parts:
+            return 'ALL'
+        if not parts:
+            return 'none'
+        return ', '.join(parts)
+
+    # ------------------------------------------------------------------
+    # Selection
+    # ------------------------------------------------------------------
+
+    def _selected_row(self) -> int:
+        rows = self._table.selectionModel().selectedRows()
+        return rows[0].row() if rows else -1
+
+    def _selected_user(self):
+        row = self._selected_row()
+        return self._users[row] if 0 <= row < len(self._users) else None
+
+    def _selected_username(self) -> str:
+        user = self._selected_user()
+        return user.get('username', '') if user else ''
+
+    def _select_username(self, username: str) -> None:
+        for row, user in enumerate(self._users):
+            if user.get('username') == username:
+                self._table.selectRow(row)
+                return
+        if self._users:
+            self._table.selectRow(0)
+        else:
+            self._on_selection_changed()
+
+    def _on_selection_changed(self) -> None:
+        user = self._selected_user()
+        if user is None:
+            self._parts_box.setTitle('Firmware for —')
+            self._parts_list.clear()
+            self._save_btn.setEnabled(False)
+            return
+
+        name = user.get('username', '')
+        self._parts_box.setTitle(f"Firmware for '{name}'")
+        self._save_btn.setEnabled(True)
+        self._active_btn.setText('Enable' if not user.get('active') else 'Disable')
+        self._admin_btn.setText(
+            'Remove HQ admin' if user.get('admin') else 'Make HQ admin'
+        )
+        # The server refuses these three on your own account (they would lock
+        # HQ out); grey them out so the refusal is never a surprise.
+        is_me = (name == self._me)
+        self._active_btn.setEnabled(not is_me)
+        self._admin_btn.setEnabled(not is_me)
+        self._delete_btn.setEnabled(not is_me)
+
+        parts = list(user.get('parts') or [])
+        everything = self._ALL in parts
+        self._all_check.blockSignals(True)
+        self._all_check.setChecked(everything)
+        self._all_check.blockSignals(False)
+
+        self._parts_list.clear()
+        for part in self._catalogue:
+            item = QListWidgetItem(part)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            ticked = everything or _matches_any(part, parts)
+            item.setCheckState(
+                Qt.CheckState.Checked if ticked else Qt.CheckState.Unchecked
+            )
+            self._parts_list.addItem(item)
+        self._parts_list.setEnabled(not everything)
+
+        # A list set from the console may hold wildcards, or names for parts
+        # that are no longer in the repo. Ticking boxes here would rewrite
+        # those into plain names, so say so rather than silently doing it.
+        loose = [p for p in parts if p != self._ALL and p not in self._catalogue]
+        if loose:
+            self._parts_note.setText(
+                'Set from the console as: ' + ', '.join(loose)
+                + ' — saving here replaces that with exactly the ticked names.'
+            )
+            self._parts_note.setVisible(True)
+        else:
+            self._parts_note.setVisible(False)
+
+    def _on_all_toggled(self, checked: bool) -> None:
+        self._parts_list.setEnabled(not checked)
+        if checked:
+            for row in range(self._parts_list.count()):
+                self._parts_list.item(row).setCheckState(Qt.CheckState.Checked)
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+
+    def _on_save_parts(self) -> None:
+        user = self._selected_user()
+        if user is None:
+            return
+        name = user.get('username', '')
+        if self._all_check.isChecked():
+            parts = [self._ALL]
+        else:
+            parts = [
+                self._parts_list.item(row).text()
+                for row in range(self._parts_list.count())
+                if self._parts_list.item(row).checkState() == Qt.CheckState.Checked
+            ]
+        if not parts:
+            confirm = QMessageBox.question(
+                self, 'No firmware',
+                f"'{name}' will not be able to download anything at all. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+        self._run(
+            lambda: admin_client.set_parts(name, parts),
+            lambda _: self._after_change(f"Saved firmware access for '{name}'."),
+            f'Saving firmware access for {name}…',
+        )
+
+    def _on_new_account(self) -> None:
+        dlg = _AccountDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        username, distributor, password = dlg.values()
+        # New accounts start closed — nothing is visible until HQ ticks it.
+        self._run(
+            lambda: admin_client.create_or_reset_user(
+                username, password, distributor, parts=[], admin=False
+            ),
+            lambda _: self._after_change(
+                f"Created '{username}'. Now tick the firmware they need."
+            ),
+            f'Creating {username}…',
+        )
+
+    def _on_reset_password(self) -> None:
+        user = self._selected_user()
+        if user is None:
+            return
+        name = user.get('username', '')
+        dlg = _AccountDialog(self, username=name,
+                             distributor=user.get('distributor', ''))
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        _, distributor, password = dlg.values()
+        # parts/admin deliberately omitted: a password reset must not widen or
+        # narrow what the account can reach.
+        self._run(
+            lambda: admin_client.create_or_reset_user(name, password, distributor),
+            lambda _: self._after_change(f"New password set for '{name}'."),
+            f'Updating {name}…',
+        )
+
+    def _on_toggle_active(self) -> None:
+        user = self._selected_user()
+        if user is None:
+            return
+        name = user.get('username', '')
+        make_active = not user.get('active')
+        if not make_active:
+            confirm = QMessageBox.question(
+                self, 'Disable account',
+                f"Disable '{name}'? They are cut off immediately, even if they "
+                f'are logged in right now.',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+        self._run(
+            lambda: admin_client.set_active(name, make_active),
+            lambda _: self._after_change(
+                f"'{name}' is now {'active' if make_active else 'disabled'}."
+            ),
+            f'Updating {name}…',
+        )
+
+    def _on_toggle_admin(self) -> None:
+        user = self._selected_user()
+        if user is None:
+            return
+        name = user.get('username', '')
+        make_admin = not user.get('admin')
+        if make_admin:
+            confirm = QMessageBox.question(
+                self, 'Make HQ admin',
+                f"Give '{name}' full control of every account and all firmware "
+                f'access? This is meant for Styrestrøm staff, not distributors.',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+        self._run(
+            lambda: admin_client.set_admin(name, make_admin),
+            lambda _: self._after_change(
+                f"'{name}' is {'now' if make_admin else 'no longer'} an HQ admin."
+            ),
+            f'Updating {name}…',
+        )
+
+    def _on_delete(self) -> None:
+        user = self._selected_user()
+        if user is None:
+            return
+        name = user.get('username', '')
+        confirm = QMessageBox.question(
+            self, 'Delete account',
+            f"Delete '{name}' ({user.get('distributor', '')}) for good? Disabling "
+            f'keeps the account and its firmware list; deleting does not.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._run(
+            lambda: admin_client.delete_user(name),
+            lambda _: self._after_change(f"Deleted '{name}'."),
+            f'Deleting {name}…',
+        )
+
+    def _after_change(self, message: str) -> None:
+        self._run(admin_client.list_users, self._on_users_loaded, message)
+
+    def closeEvent(self, event) -> None:      # noqa: N802 — Qt naming
+        self._finish_thread()
+        super().closeEvent(event)
+
+
+def _matches_any(part: str, patterns) -> bool:
+    """Client-side twin of the server's allow-list match, so the ticked boxes
+    show exactly what the proxy would let through."""
+    name = str(part).strip().lower()
+    return any(fnmatch.fnmatchcase(name, str(p).strip().lower()) for p in patterns)
+
+
+# ---------------------------------------------------------------------------
 # Scan worker — listens for a PLC boot announcement and reads identity
 # ---------------------------------------------------------------------------
 
@@ -540,6 +1102,9 @@ class MainWindow(QMainWindow):
         self._login_ok:          bool = False   # main() checks this before showing
         self._account_username:  str  = ''
         self._account_distributor: str = ''
+        # HQ accounts get Settings -> Manage distributors. The server re-checks
+        # this on every admin call, so the flag only decides what is shown.
+        self._account_admin:     bool = False
         self._last_scan_label: str = ''   # carried into the flash event
         # Once the operator acknowledges the first "Flash complete" popup
         # this session, suppress it on every later flash so batch mode is
@@ -923,9 +1488,29 @@ class MainWindow(QMainWindow):
     def _build_menu(self) -> None:
         bar = self.menuBar()
         settings_menu = bar.addMenu('&Settings')
+        self._admin_action = QAction('&Manage distributors…', self)
+        self._admin_action.setStatusTip(
+            'Create distributor accounts and choose which firmware each may '
+            'see and download'
+        )
+        self._admin_action.triggered.connect(self._open_admin)
+        self._admin_action.setVisible(False)   # unhidden after an HQ login
+        settings_menu.addAction(self._admin_action)
         logout_action = QAction('&Log out (switch account)…', self)
         logout_action.triggered.connect(self._logout)
         settings_menu.addAction(logout_action)
+
+    def _refresh_admin_menu(self) -> None:
+        self._admin_action.setVisible(self._account_admin)
+
+    def _open_admin(self) -> None:
+        dlg = _DistributorAdminDialog(self, self._account_username)
+        dlg.exec()
+        # An admin may have just changed their own firmware list, or somebody
+        # else's; the safest thing is to make the operator re-pull the list.
+        self._part_combo.clear()
+        self._part_combo.setPlaceholderText('— click Refresh to load list —')
+        self._download_btn.setEnabled(False)
 
     def _distributor(self) -> str:
         return str(self._settings.value('distributor', '', type=str))
@@ -951,6 +1536,10 @@ class MainWindow(QMainWindow):
             self._account_distributor = str(
                 self._settings.value('auth_distributor', '', type=str)
             )
+            self._account_admin = bool(
+                self._settings.value('auth_admin', False, type=bool)
+            )
+            self._refresh_admin_menu()
             self._append_log(
                 f'Logged in as {username} @ {self._account_distributor}'
             )
@@ -970,22 +1559,29 @@ class MainWindow(QMainWindow):
         expires     = int(info.get('expires_at', 0))
         username    = str(info.get('username', ''))
         distributor = str(info.get('distributor', ''))
+        is_admin    = bool(info.get('admin', False))
         auth.set_token(token)
         self._settings.setValue('auth_token', token)
         self._settings.setValue('auth_expires', expires)
         self._settings.setValue('auth_username', username)
         self._settings.setValue('auth_distributor', distributor)
+        self._settings.setValue('auth_admin', is_admin)
         # Feed the existing flash-log / HQ-event identity from the account.
         self._settings.setValue('distributor', distributor)
         self._settings.setValue('operator', username)
         self._account_username = username
         self._account_distributor = distributor
+        self._account_admin = is_admin
+        self._refresh_admin_menu()
         self._append_log(f'Logged in as {username} @ {distributor}')
 
     def _logout(self) -> None:
         auth.clear_token()
         self._settings.remove('auth_token')
         self._settings.remove('auth_expires')
+        self._settings.remove('auth_admin')
+        self._account_admin = False
+        self._refresh_admin_menu()
         self._append_log('Logged out.')
         if not self._show_login():
             QApplication.instance().quit()
@@ -996,6 +1592,9 @@ class MainWindow(QMainWindow):
         auth.clear_token()
         self._settings.remove('auth_token')
         self._settings.remove('auth_expires')
+        self._settings.remove('auth_admin')
+        self._account_admin = False
+        self._refresh_admin_menu()
         self._append_log('Session expired or access revoked — please log in again.')
         if not self._show_login(message='Your session expired. Please log in again.'):
             QApplication.instance().quit()
@@ -1183,6 +1782,16 @@ class MainWindow(QMainWindow):
         for p in parts:
             self._part_combo.addItem(p)
         self._download_btn.setEnabled(bool(parts))
+        if not parts:
+            # The proxy only lists firmware this account is entitled to, so an
+            # empty list is an account question, not a broken connection.
+            self._part_combo.setPlaceholderText('— no firmware for this account —')
+            self._status_label.setText('No firmware assigned to your account')
+            self._append_log(
+                'No firmware is assigned to this login. Contact Styrestrøm '
+                'to have the parts you need enabled.'
+            )
+            return
         self._status_label.setText(f'{len(parts)} part(s) found.')
         self._append_log(f'Parts available: {", ".join(parts)}')
 

@@ -8,10 +8,10 @@
 # different entry here is only useful for testing the PCAN adapter at a
 # specific app-side bitrate.
 MODULE_TYPES = {
-    'Boot mode (125 kbit/s)':                      {'can_fd': False, 'bitrate': 125000, 'data_bitrate': 0},
-    'MRS 1.107.110.00 (500 kbit/s)':              {'can_fd': False, 'bitrate': 500000, 'data_bitrate': 0},
-    'MRS 1.111.311.00 (500 kbit/s)':              {'can_fd': False, 'bitrate': 500000, 'data_bitrate': 0},
-    'MRS 1.158.310.00 CAN FD (2000/500 kbit/s)':  {'can_fd': True,  'bitrate': 500000, 'data_bitrate': 2000000},
+    'Boot mode (125 kbit/s)':               {'can_fd': False, 'bitrate': 125000, 'data_bitrate': 0},
+    '1493X-V4 (500 kbit/s)':                {'can_fd': False, 'bitrate': 500000, 'data_bitrate': 0},
+    '14930 Taxi / 1498X ATV (500 kbit/s)':  {'can_fd': False, 'bitrate': 500000, 'data_bitrate': 0},
+    '1494X CAN FD (2000/500 kbit/s)':       {'can_fd': True,  'bitrate': 500000, 'data_bitrate': 2000000},
 }
 
 DEFAULT_CHANNEL = 'PCAN_USBBUS1'

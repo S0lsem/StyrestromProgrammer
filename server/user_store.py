@@ -14,14 +14,31 @@ Design goals:
 
 The users file is JSON:
     {
-      "acme":   {"pw": "pbkdf2_sha256$...", "distributor": "Acme AS",  "active": true},
-      "bravo":  {"pw": "pbkdf2_sha256$...", "distributor": "Bravo Ltd", "active": false}
+      "hq":     {"pw": "pbkdf2_sha256$...", "distributor": "Styrestrom AS",
+                 "active": true,  "parts": ["*"], "admin": true},
+      "acme":   {"pw": "pbkdf2_sha256$...", "distributor": "Acme AS",
+                 "active": true,  "parts": ["*"]},
+      "bravo":  {"pw": "pbkdf2_sha256$...", "distributor": "Bravo Ltd",
+                 "active": false, "parts": ["1493X-V4", "1494X*"]}
     }
 Usernames are stored and looked up lower-cased.
+
+``parts`` is the firmware allow-list: which part folders that distributor may
+see in the app's Part dropdown and download. Entries are glob patterns matched
+case-insensitively (``1494X*`` covers every 1494X revision). ``["*"]`` means
+everything; ``[]`` means nothing. A **missing** ``parts`` key also means
+everything — so accounts created before this feature keep working untouched
+after the server is upgraded, and HQ narrows them down deliberately.
+
+``admin`` (default false) marks an HQ account that may manage the others
+through the ``/admin/*`` endpoints — that is what unlocks the Distributors
+window in the programmer app. Grant it from the console with
+``python manage_users.py admin <username>``.
 """
 from __future__ import annotations
 
 import base64
+import fnmatch
 import hashlib
 import hmac
 import json
@@ -95,12 +112,28 @@ def verify_password(password: str, stored: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def upsert_user(username: str, password: str, distributor: str,
-                active: bool = True) -> None:
+                active: bool = True, parts: list | None = None,
+                admin: bool | None = None) -> None:
+    """Create or reset an account.
+
+    *parts* is the firmware allow-list (see module docstring). Passing None for
+    *parts* or *admin* on an **existing** user keeps their current values, so
+    resetting a forgotten password neither re-opens every part to them nor
+    strips an HQ account of its admin rights.
+    """
     users = load_users()
-    users[username.strip().lower()] = {
+    key = username.strip().lower()
+    existing = users.get(key) or {}
+    if parts is None:
+        parts = existing.get('parts', ALL_PARTS)
+    if admin is None:
+        admin = bool(existing.get('admin', False))
+    users[key] = {
         'pw': hash_password(password),
         'distributor': distributor,
         'active': active,
+        'parts': _clean_patterns(parts),
+        'admin': bool(admin),
     }
     save_users(users)
 
@@ -114,6 +147,96 @@ def set_active(username: str, active: bool) -> bool:
     u['active'] = active
     save_users(users)
     return True
+
+
+def set_parts(username: str, parts: list) -> bool:
+    """Replace a user's firmware allow-list. False if the user doesn't exist."""
+    users = load_users()
+    u = users.get(username.strip().lower())
+    if u is None:
+        return False
+    u['parts'] = _clean_patterns(parts)
+    save_users(users)
+    return True
+
+
+def set_admin(username: str, admin: bool) -> bool:
+    """Grant/revoke HQ admin rights. False if the user doesn't exist."""
+    users = load_users()
+    u = users.get(username.strip().lower())
+    if u is None:
+        return False
+    u['admin'] = bool(admin)
+    save_users(users)
+    return True
+
+
+def delete_user(username: str) -> bool:
+    """Remove an account entirely. False if it didn't exist."""
+    users = load_users()
+    if users.pop(username.strip().lower(), None) is None:
+        return False
+    save_users(users)
+    return True
+
+
+def is_admin(user: dict | None) -> bool:
+    """True if *user* may manage other accounts. Defaults to False, so an
+    upgraded server hands nobody admin rights by accident."""
+    return bool(user and user.get('admin', False))
+
+
+def describe_user(username: str, user: dict) -> dict:
+    """The account as the admin UI sees it — never includes the password hash."""
+    return {
+        'username':    username,
+        'distributor': user.get('distributor', ''),
+        'active':      bool(user.get('active', False)),
+        'admin':       is_admin(user),
+        'parts':       user_parts(user),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Firmware allow-list
+# ---------------------------------------------------------------------------
+
+ALL_PARTS = ['*']
+
+
+def _clean_patterns(parts) -> list:
+    """Normalise an allow-list: strings only, trimmed, blanks dropped."""
+    if not isinstance(parts, (list, tuple)):
+        return list(ALL_PARTS)
+    return [str(p).strip() for p in parts if str(p).strip()]
+
+
+def user_parts(user: dict | None) -> list:
+    """The allow-list for *user*. A missing key means 'everything' so that
+    pre-existing accounts keep working after the server is upgraded."""
+    if not user or 'parts' not in user:
+        return list(ALL_PARTS)
+    return _clean_patterns(user.get('parts'))
+
+
+def is_part_allowed(user: dict | None, part: str) -> bool:
+    """True if *user* may see/download the firmware folder *part*.
+
+    Patterns are globs matched case-insensitively, so '1494X*' covers every
+    1494X revision and an exact name matches only itself.
+    """
+    name = str(part).strip().lower()
+    if not name:
+        return False
+    return any(
+        fnmatch.fnmatchcase(name, pattern.lower())
+        for pattern in user_parts(user)
+    )
+
+
+def filter_parts(user: dict | None, parts) -> list:
+    """Keep only the parts *user* is allowed to see, preserving order."""
+    return [p for p in parts if is_part_allowed(user, p)]
 
 
 # ---------------------------------------------------------------------------

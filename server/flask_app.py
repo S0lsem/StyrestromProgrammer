@@ -40,6 +40,11 @@ Environment variables (set in your WSGI file or in a .env file):
   USERS_FILE          = path to users.json (default: next to these files).
 
 Accounts are created with:  python manage_users.py add <username> "<Distributor>"
+Firmware access per distributor: python manage_users.py parts <username> <part>...
+(a new account starts with access to everything; narrow it with "parts")
+
+HQ can do all of that from the programmer app instead, via the /admin/* routes
+below. Unlock it once per HQ account with:  python manage_users.py admin <username>
 
 Expected repo layout (private GitHub repo, owner/name set below):
   mrs-firmware/
@@ -96,13 +101,14 @@ def _bearer_token() -> str:
     return ''
 
 
-def _require_auth() -> str:
-    """Authorize a firmware request. Returns the username (or '' for a legacy
-    key match). Aborts 401/403 if the caller isn't allowed.
+def _require_auth() -> tuple[str, dict | None]:
+    """Authorize a firmware request. Returns (username, user_record).
 
-    A valid login token wins. When LOGIN_ENFORCED is off, a request with no
-    token falls back to the legacy PROXY_API_KEY check so old apps keep working
-    during the rollout window.
+    Aborts 401/403 if the caller isn't allowed. A valid login token wins. When
+    LOGIN_ENFORCED is off, a request with no token falls back to the legacy
+    PROXY_API_KEY check so old apps keep working during the rollout window —
+    that path returns ('', None), which the firmware allow-list treats as
+    "everything" because there is no account to look the list up on.
     """
     token = _bearer_token()
     if token:
@@ -110,12 +116,12 @@ def _require_auth() -> str:
         if username:
             user = user_store.get_user(username)
             if user and user.get('active', False):
-                return username
+                return username, user
         abort(401, 'Login expired or revoked. Please log in again.')
 
     if not LOGIN_ENFORCED:
         _check_api_key()   # legacy migration path
-        return ''
+        return '', None
     abort(401, 'Login required.')
 
 
@@ -180,12 +186,19 @@ def login():
         'expires_at':  exp,
         'username':    username,
         'distributor': user.get('distributor', ''),
+        'admin':       user_store.is_admin(user),
     })
 
 
 @app.route('/parts', methods=['GET'])
 def list_parts():
-    _require_auth()
+    """List the firmware parts this distributor is allowed to see.
+
+    Filtering happens here, not in the app: a part the account isn't entitled
+    to must never travel over the wire, not even as a name in a list the
+    client would hide.
+    """
+    _, user = _require_auth()
     try:
         items = _github_get(FIRMWARE_PATH)
         parts = sorted(
@@ -193,7 +206,7 @@ def list_parts():
             for item in items
             if item['type'] == 'dir' and not item['name'].startswith('.')
         )
-        return jsonify(parts)
+        return jsonify(user_store.filter_parts(user, parts))
     except HTTPError as exc:
         return jsonify({'error': f'GitHub API error: {exc.code}'}), 502
     except URLError as exc:
@@ -208,7 +221,14 @@ def get_firmware(part: str):
     .s19 found. Any filename works, so the file can be uploaded straight
     out of MRS's bin/ folder without renaming.
     """
-    _require_auth()
+    _, user = _require_auth()
+    if not user_store.is_part_allowed(user, part):
+        # Same wording whether the part is unassigned or does not exist, so a
+        # distributor cannot probe the catalogue by guessing folder names.
+        return jsonify({
+            'error': f"'{part}' is not enabled for your account. "
+                     f'Contact Styrestrøm to have it added.',
+        }), 403
     try:
         located = _find_s19(part)
         if located is None:
@@ -222,6 +242,128 @@ def get_firmware(part: str):
         return jsonify({'error': f'GitHub API error: {exc.code}'}), 502
     except URLError as exc:
         return jsonify({'error': f'Network error: {exc.reason}'}), 502
+
+
+# ---------------------------------------------------------------------------
+# Admin API — backs the Distributors window in the programmer app.
+#
+# Every route re-checks the admin flag on the live account, so revoking admin
+# (or disabling the account) takes effect on the very next request rather than
+# whenever the token happens to expire. Password hashes are never returned.
+# ---------------------------------------------------------------------------
+
+def _require_admin() -> tuple[str, dict]:
+    """Authorize an admin request. Returns (username, user_record)."""
+    username, user = _require_auth()
+    if not user_store.is_admin(user):
+        abort(403, 'This account is not allowed to manage distributors.')
+    return username, user
+
+
+def _json_body() -> dict:
+    return request.get_json(silent=True) or {}
+
+
+@app.route('/admin/users', methods=['GET'])
+def admin_list_users():
+    _require_admin()
+    users = user_store.load_users()
+    return jsonify([
+        user_store.describe_user(name, users[name]) for name in sorted(users)
+    ])
+
+
+@app.route('/admin/parts', methods=['GET'])
+def admin_list_all_parts():
+    """The full firmware catalogue, unfiltered — the admin picks from this."""
+    _require_admin()
+    try:
+        items = _github_get(FIRMWARE_PATH)
+        return jsonify(sorted(
+            item['name']
+            for item in items
+            if item['type'] == 'dir' and not item['name'].startswith('.')
+        ))
+    except HTTPError as exc:
+        return jsonify({'error': f'GitHub API error: {exc.code}'}), 502
+    except URLError as exc:
+        return jsonify({'error': f'Network error: {exc.reason}'}), 502
+
+
+@app.route('/admin/users', methods=['POST'])
+def admin_upsert_user():
+    """Create an account, or reset an existing one's password + distributor.
+
+    Body: {username, password, distributor, parts?, admin?}
+    Omitting parts/admin on an existing account leaves those untouched.
+    """
+    _require_admin()
+    data = _json_body()
+    username    = str(data.get('username', '')).strip().lower()
+    password    = str(data.get('password', ''))
+    distributor = str(data.get('distributor', '')).strip()
+
+    if not username or not username.replace('-', '').replace('_', '').isalnum():
+        return jsonify({'error': 'Username must be letters, digits, - or _.'}), 400
+    if len(password) < 8:
+        return jsonify({'error': 'Password must be at least 8 characters.'}), 400
+    if not distributor:
+        return jsonify({'error': 'Distributor name is required.'}), 400
+
+    parts = data.get('parts')
+    admin = data.get('admin')
+    user_store.upsert_user(
+        username, password, distributor, active=True,
+        parts=list(parts) if isinstance(parts, list) else None,
+        admin=bool(admin) if admin is not None else None,
+    )
+    users = user_store.load_users()
+    return jsonify(user_store.describe_user(username, users[username]))
+
+
+@app.route('/admin/users/<username>', methods=['PATCH'])
+def admin_update_user(username: str):
+    """Change active / parts / admin on an existing account.
+
+    Body may carry any of: {active: bool, parts: [...], admin: bool}.
+    An admin cannot disable or demote their own account — that is the one
+    mistake that would lock HQ out of this API entirely.
+    """
+    me, _ = _require_admin()
+    target = username.strip().lower()
+    if user_store.get_user(target) is None:
+        return jsonify({'error': f"No such account: '{username}'."}), 404
+
+    data = _json_body()
+    self_edit = (target == me)
+
+    if 'active' in data:
+        if self_edit and not data['active']:
+            return jsonify({'error': 'You cannot disable your own account.'}), 400
+        user_store.set_active(target, bool(data['active']))
+    if 'admin' in data:
+        if self_edit and not data['admin']:
+            return jsonify({'error': 'You cannot remove your own admin rights.'}), 400
+        user_store.set_admin(target, bool(data['admin']))
+    if 'parts' in data:
+        parts = data['parts']
+        if not isinstance(parts, list):
+            return jsonify({'error': 'parts must be a list of names.'}), 400
+        user_store.set_parts(target, parts)
+
+    users = user_store.load_users()
+    return jsonify(user_store.describe_user(target, users[target]))
+
+
+@app.route('/admin/users/<username>', methods=['DELETE'])
+def admin_delete_user(username: str):
+    me, _ = _require_admin()
+    target = username.strip().lower()
+    if target == me:
+        return jsonify({'error': 'You cannot delete your own account.'}), 400
+    if not user_store.delete_user(target):
+        return jsonify({'error': f"No such account: '{username}'."}), 404
+    return jsonify({'deleted': target})
 
 
 @app.route('/health', methods=['GET'])

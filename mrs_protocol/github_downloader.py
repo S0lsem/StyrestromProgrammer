@@ -36,17 +36,20 @@ def _proxy_request(endpoint: str) -> tuple[int, bytes, str]:
             raise AuthenticationError(
                 'Login required or expired. Please log in again.'
             ) from exc
-        if exc.code == 403:
-            raise PermissionError(
-                'Access denied by proxy server. Check PROXY_API_KEY in config.py.'
-            ) from exc
-        if exc.code == 404:
-            raise FileNotFoundError(f'Not found: {endpoint}') from exc
         body = ''
         try:
             body = exc.read().decode()
         except Exception:
             pass
+        if exc.code == 403:
+            # The server sends a plain-language reason for a firmware the
+            # account isn't entitled to; show that rather than a config hint.
+            raise PermissionError(
+                _server_error(body)
+                or 'Access denied by proxy server. Check PROXY_API_KEY in config.py.'
+            ) from exc
+        if exc.code == 404:
+            raise FileNotFoundError(f'Not found: {endpoint}') from exc
         raise RuntimeError(f'Server error {exc.code}: {body}') from exc
     except URLError as exc:
         raise ConnectionError(
@@ -54,8 +57,22 @@ def _proxy_request(endpoint: str) -> tuple[int, bytes, str]:
         ) from exc
 
 
+def _server_error(body: str) -> str:
+    """Pull the human-readable message out of a JSON error body, if there is one."""
+    try:
+        message = json.loads(body).get('error', '')
+    except (ValueError, AttributeError):
+        return ''
+    return str(message).strip()
+
+
 def list_parts() -> list[str]:
-    """Return sorted list of part folder names from the proxy."""
+    """Return the part folder names this login is allowed to see.
+
+    The proxy filters the list per distributor account, so this is already
+    narrowed down — an empty list means the account has no firmware assigned,
+    not that the repo is empty.
+    """
     _, body, _ = _proxy_request('/parts')
     return json.loads(body)
 
