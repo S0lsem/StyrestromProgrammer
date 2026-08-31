@@ -24,7 +24,42 @@ def _parse_version(tag: str) -> tuple[int, ...]:
     return tuple(int(x) for x in clean.split('.') if x.isdigit())
 
 
-def check_for_update() -> dict:
+def _fetch_release(include_prerelease: bool) -> dict:
+    """The release to offer, as GitHub's JSON. Raises HTTPError/URLError.
+
+    ``/releases/latest`` deliberately skips prereleases and drafts, which is
+    what gates a staged rollout: HQ publishes with ``release.ps1 -Prerelease``
+    and distributors' clients simply do not see it until it is promoted.
+
+    An HQ account asks for ``/releases`` instead and takes the newest
+    non-draft, so it picks up a prerelease the moment it is published. Drafts
+    are skipped either way — they have no uploaded asset to download.
+
+    Returns ``{}`` when there is nothing to offer.
+    """
+    headers = {
+        'Accept': 'application/vnd.github.v3+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+    }
+
+    if not include_prerelease:
+        url = f'{_API}/repos/{_REPO_OWNER}/{_REPO_NAME}/releases/latest'
+        with urlopen(Request(url, headers=headers), timeout=10) as resp:
+            return json.loads(resp.read())
+
+    url = f'{_API}/repos/{_REPO_OWNER}/{_REPO_NAME}/releases?per_page=10'
+    with urlopen(Request(url, headers=headers), timeout=10) as resp:
+        releases = json.loads(resp.read())
+    if not isinstance(releases, list):
+        return {}
+    # GitHub returns newest first; a draft has no downloadable asset.
+    for release in releases:
+        if isinstance(release, dict) and not release.get('draft'):
+            return release
+    return {}
+
+
+def check_for_update(include_prerelease: bool = False) -> dict:
     """
     Check GitHub for a newer release.
 
@@ -48,13 +83,10 @@ def check_for_update() -> dict:
     }
 
     try:
-        url = f'{_API}/repos/{_REPO_OWNER}/{_REPO_NAME}/releases/latest'
-        req = Request(url, headers={
-            'Accept': 'application/vnd.github.v3+json',
-            'X-GitHub-Api-Version': '2022-11-28',
-        })
-        with urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
+        data = _fetch_release(include_prerelease)
+        if not data:
+            result['error'] = 'No releases published yet.'
+            return result
     except HTTPError as exc:
         if exc.code == 404:
             result['error'] = 'No releases published yet.'

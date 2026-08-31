@@ -151,9 +151,13 @@ def describe_baud(bitrate: int, is_can_fd: bool, data_bitrate: int) -> str:
 class _UpdateCheckWorker(QObject):
     result = pyqtSignal(dict)
 
+    def __init__(self, include_prerelease: bool = False) -> None:
+        super().__init__()
+        self._include_prerelease = include_prerelease
+
     def run(self) -> None:
         from mrs_protocol.update_checker import check_for_update
-        self.result.emit(check_for_update())
+        self.result.emit(check_for_update(self._include_prerelease))
 
 
 class _UpdateDownloadWorker(QObject):
@@ -1812,7 +1816,18 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _check_for_updates(self) -> None:
-        self._update_worker = _UpdateCheckWorker()
+        # HQ accounts see prereleases, distributors only promoted builds. The
+        # admin flag comes from the server at login, and _restore_or_login()
+        # has already run by the time we get here, so it is set.
+        #
+        # This is a rollout gate, not a security boundary: the programmer repo
+        # is public, so a distributor who goes looking can find a prerelease on
+        # GitHub. It stops them being *offered* an untested build, which is the
+        # actual risk. The firmware — the part that is secret — stays behind
+        # the proxy's per-account entitlements either way.
+        self._update_worker = _UpdateCheckWorker(
+            include_prerelease=self._account_admin
+        )
         self._update_thread = QThread(self)
         self._update_worker.moveToThread(self._update_thread)
         self._update_thread.started.connect(self._update_worker.run)

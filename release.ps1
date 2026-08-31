@@ -28,7 +28,14 @@ param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
     [string]$Version,
 
-    [string]$Notes = ''
+    [string]$Notes = '',
+
+    # Publish as a prerelease. GitHub's /releases/latest skips prereleases, and
+    # that is exactly what distributors' clients ask for -- so they are never
+    # offered the build. HQ accounts query /releases instead and pick it up
+    # immediately, which is how you test on your own bench first.
+    # Promote it to everyone later with:  .\promote.ps1 -Version 1.0.18
+    [switch]$Prerelease
 )
 
 # NOTE: deliberately NOT 'Stop'. Under Windows PowerShell 5.1, 'Stop' turns a
@@ -113,7 +120,7 @@ $Body = @{
     name             = $Tag
     body             = $Notes
     draft            = $false
-    prerelease       = $false
+    prerelease       = [bool]$Prerelease
 } | ConvertTo-Json
 $Release = Invoke-RestMethod -Method Post `
     -Uri "https://api.github.com/repos/$RepoOwner/$RepoName/releases" `
@@ -145,12 +152,21 @@ if (-not $uploaded) { throw "Asset upload failed after 4 attempts." }
 
 # --- 7. Verify --------------------------------------------------------------
 Step "Verifying"
-$Check = Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest" -Headers $Headers
+# Ask for the tag directly, not /releases/latest: that endpoint deliberately
+# skips prereleases, so it would return the previous stable build and fail
+# verification for a prerelease that published perfectly well.
+$Check = Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoOwner/$RepoName/releases/tags/$Tag" -Headers $Headers
 $Assets = ($Check.assets | ForEach-Object { $_.name }) -join ', '
 Write-Host ""
 if ($Check.tag_name -eq $Tag -and $Assets -match [regex]::Escape($ExeName)) {
     Write-Host "SUCCESS: published $($Check.tag_name) with asset(s): $Assets" -ForegroundColor Green
-    Write-Host "Older builds will now show the 'Update and Restart' button." -ForegroundColor Green
+    if ($Check.prerelease) {
+        Write-Host "This is a PRERELEASE." -ForegroundColor Yellow
+        Write-Host "  HQ accounts will be offered it on next launch. Distributors will NOT." -ForegroundColor Yellow
+        Write-Host "  When you are happy with it:  .\promote.ps1 -Version $Version" -ForegroundColor Yellow
+    } else {
+        Write-Host "Older builds will now show the 'Update and Restart' button." -ForegroundColor Green
+    }
 } else {
-    throw "Verification failed. latest=$($Check.tag_name) assets=$Assets"
+    throw "Verification failed. tag=$($Check.tag_name) assets=$Assets"
 }
