@@ -2234,7 +2234,26 @@ class MainWindow(QMainWindow):
         self._stop_batch_listener()
         self._drain_threads()
         self._wait_for_event_posts()
+        self._detach_log_handler()
         super().closeEvent(event)
+
+    def _detach_log_handler(self) -> None:
+        """Take the GUI log handler off the root logger before the window goes.
+
+        ``_QLogHandler`` is a QObject as well as a logging.Handler. Left
+        attached, Python's ``logging.shutdown()`` atexit hook reaches for it
+        after Qt has destroyed the C++ side and raises "wrapped C/C++ object
+        has been deleted". Harmless at that point in the shutdown, but it is a
+        dangling reference to a dead object and there is no reason to keep one.
+        """
+        handler = getattr(self, '_log_handler', None)
+        if handler is None:
+            return
+        try:
+            logging.getLogger().removeHandler(handler)
+        except Exception:   # noqa: BLE001 — never obstruct a close
+            pass
+        self._log_handler = None
 
     def _drain_threads(self, timeout_ms: int = 5000) -> None:
         """Stop the worker threads before the window that owns them is destroyed.
