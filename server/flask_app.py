@@ -504,7 +504,12 @@ def admin_status():
     costs nothing.
     """
     _require_admin()
-    quota = {'available': False}
+    if not GITHUB_TOKEN:
+        quota = {'available': False,
+                 'reason': 'GITHUB_TOKEN is not set on the server. Add it to the '
+                           'WSGI configuration file and press Reload.'}
+        return jsonify({'mirror': firmware_mirror.status(), 'github': quota})
+
     try:
         req = Request(f'{_API}/rate_limit', headers={
             'Authorization': f'Bearer {GITHUB_TOKEN}',
@@ -520,9 +525,34 @@ def admin_status():
             'used':      int(core.get('used', 0)),
             'reset':     int(core.get('reset', 0)),
         }
-    except (HTTPError, URLError, ValueError, KeyError):
-        pass                    # a missing quota reading must not break the window
+    # A failed reading must never break the window, but it must not be silent
+    # either. Reporting a bare available:false cost a day once: the token had
+    # expired, and the only way to discover that was to press Sync and read the
+    # 401 off the error dialog. The status call already knew.
+    except HTTPError as exc:
+        quota = {'available': False, 'reason': _quota_failure_reason(exc.code)}
+    except URLError as exc:
+        quota = {'available': False,
+                 'reason': f'Could not reach GitHub: {exc.reason}.'}
+    except (ValueError, KeyError):
+        quota = {'available': False,
+                 'reason': 'GitHub replied with something this server could not read.'}
     return jsonify({'mirror': firmware_mirror.status(), 'github': quota})
+
+
+def _quota_failure_reason(code: int) -> str:
+    """Plain-language cause for a failed /rate_limit call, for the admin window."""
+    if code == 401:
+        return ('GitHub rejected the token (401) — it has expired or been revoked. '
+                'Put a new one in GITHUB_TOKEN in the WSGI file and press Reload. '
+                'Syncing will fail until you do.')
+    if code == 403:
+        return ('GitHub refused the token (403) — either the hourly quota is spent '
+                'or the token has lost access to the firmware repo.')
+    if code == 404:
+        return ('GitHub returned 404 — the token cannot see the firmware repo. '
+                'Check its repository access includes the firmware repository.')
+    return f'GitHub returned HTTP {code}.'
 
 
 @app.route('/health', methods=['GET'])

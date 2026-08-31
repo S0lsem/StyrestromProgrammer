@@ -149,11 +149,20 @@ def sync(list_dir, get_file) -> dict:
             if not is_safe_part(part):
                 skipped.append({'part': part, 'reason': 'unsafe folder name'})
                 continue
-            located = _find_s19(part, list_dir)
-            if located is None:
+            candidates = _s19_candidates(part, list_dir)
+            if not candidates:
                 skipped.append({'part': part, 'reason': 'no .s19 file found'})
                 continue
-            folder, name = located
+            if len(candidates) > 1:
+                names = ', '.join(sorted(n for _folder, n in candidates))
+                skipped.append({
+                    'part': part,
+                    'reason': (f'{len(candidates)} .s19 files found ({names}) — '
+                               f'cannot tell which is the current build; leave '
+                               f'only one in the folder'),
+                })
+                continue
+            folder, name = candidates[0]
             info = get_file(f'{folder}/{name}')
             try:
                 text = _decode(info)
@@ -188,17 +197,38 @@ def sync(list_dir, get_file) -> dict:
             'synced_at': index['synced_at']}
 
 
-def _find_s19(part: str, list_dir):
-    """First .s19 in the part folder, else in its src/ subfolder."""
+def _s19_candidates(part: str, list_dir) -> list:
+    """Every .s19 in the part folder, else every .s19 in its src/ subfolder.
+
+    Returns a list of ``(folder, name)``. The part root wins outright: if it
+    holds any .s19 at all, ``src/`` is not consulted.
+    """
     for folder in (part, f'{part}/src'):
         try:
             items = list_dir(folder)
         except Exception:               # 404 for an absent src/ is normal
             continue
-        for item in items:
-            if item.get('type') == 'file' and item['name'].lower().endswith('.s19'):
-                return folder, item['name']
-    return None
+        found = [
+            (folder, item['name']) for item in items
+            if item.get('type') == 'file' and item['name'].lower().endswith('.s19')
+        ]
+        if found:
+            return found
+    return []
+
+
+def _find_s19(part: str, list_dir):
+    """The one .s19 for *part*, or None if there isn't exactly one.
+
+    Deliberately refuses to choose between several. It used to return whichever
+    came first in GitHub's listing — which is alphabetical, not newest — so a
+    stale build left beside the current one would be mirrored silently and for
+    ever, and no amount of re-syncing would correct it. A part that is skipped
+    is visible in the sync result; a part quietly pinned to the wrong firmware
+    is not.
+    """
+    candidates = _s19_candidates(part, list_dir)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _decode(info: dict) -> str:

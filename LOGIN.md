@@ -300,12 +300,33 @@ explicitly permits for automation — used for nothing else:
 2. On the **firmware** repo (`Code-for-Highbeam-X`) → **Settings** →
    **Collaborators** → invite that account with **Read** access. Accept the
    invitation from the new account.
-3. Logged in as the new account, create a fine-grained token:
-   **Settings → Developer settings → Personal access tokens → Fine-grained**
-   - Resource owner: `S0lsem`
+3. Give that account a token. **Read this carefully — the obvious route does
+   not work.**
+
+   A *fine-grained* token can only reach repositories owned by its **resource
+   owner**, and the resource owner can only be yourself or an organisation you
+   belong to. `Code-for-Highbeam-X` is a personal repo owned by `S0lsem`, so
+   the machine account will **never** see it in the picker no matter what
+   access you grant it as a collaborator. There is no `S0lsem` option in its
+   dropdown to choose.
+
+   So pick one of:
+
+   **(a) Classic token from the machine account** — classic tokens do honour
+   collaborator access:
+   **Settings → Developer settings → Personal access tokens → Tokens (classic)**
+   - Scope: `repo` (there is no read-only variant for private repos)
+   - Expiration: set a calendar reminder to rotate it
+
+   **(b) Move the firmware repo into an organisation** (e.g.
+   `Solsem-Consulting`), then a fine-grained token works as you would expect:
+   - Resource owner: the organisation
    - Repository access: **Only select repositories** → `Code-for-Highbeam-X`
    - Repository permissions: **Contents = Read-only**
-   - Expiration: set a calendar reminder to rotate it before it lapses
+   - Note: an org's fine-grained tokens may need owner approval before use
+
+   (b) is the better end state — least privilege, and the separate quota you
+   came here for. (a) gets you there today.
 4. On PythonAnywhere, **Web** tab → WSGI configuration file, change:
    ```python
    os.environ['GITHUB_TOKEN'] = 'the-new-machine-account-token'
@@ -319,4 +340,19 @@ token keeps its own budget for releases. Nothing you do can take firmware
 delivery down.
 
 **Keep `.github_token` (releases) and `GITHUB_TOKEN` (proxy) separate.** Same
-value in both would put you straight back where you started.
+value in both would put you straight back where you started. They also need
+different permissions, and neither should be given the other's:
+
+| | Repo | Permission |
+|---|---|---|
+| `GITHUB_TOKEN` (proxy, syncs firmware) | `Code-for-Highbeam-X` | **Contents: Read-only** |
+| `.github_token` (release.ps1, publishes builds) | `StyrestromProgrammer` | **Contents: Read and write** |
+
+Releases live under the **Contents** permission — there is no separate
+"Releases" toggle, which catches people out. Leave every other permission at
+**No access**; the proxy only ever calls `GET .../contents/...`.
+
+**When the proxy's token dies**, Manage distributors says so directly — the
+health line reports e.g. *"GitHub rejected the token (401) — it has expired or
+been revoked"*. If you see that, syncing will fail until `GITHUB_TOKEN` is
+replaced in the WSGI file and the app reloaded.

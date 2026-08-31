@@ -99,6 +99,67 @@ def test_part_without_firmware_is_skipped_not_fatal(mirror):
     assert mirror.read_s19('good') == S19
 
 
+def test_two_s19_files_are_skipped_rather_than_guessed(mirror):
+    """Never silently choose between builds.
+
+    GitHub lists a folder alphabetically, so picking "the first .s19" picks by
+    filename, not by date. A stale build left beside the current one would be
+    mirrored for ever and no amount of re-syncing would correct it — the exact
+    failure that cannot be diagnosed from the distributor's end, because
+    everything looks like it worked.
+    """
+    def list_dir(sub):
+        if sub == '':
+            return [{'type': 'dir', 'name': 'PART_A'}]
+        if sub == 'PART_A':
+            return [{'type': 'file', 'name': 'aaa_old_build.s19'},
+                    {'type': 'file', 'name': 'zzz_current_build.s19'}]
+        raise FileNotFoundError(sub)
+
+    def get_file(path):
+        raise AssertionError(f'should not have fetched anything, got {path}')
+
+    result = mirror.sync(list_dir, get_file)
+
+    assert result['parts'] == []
+    assert len(result['skipped']) == 1
+    reason = result['skipped'][0]['reason']
+    assert 'aaa_old_build.s19' in reason and 'zzz_current_build.s19' in reason
+    assert '2 .s19 files' in reason
+
+
+def test_a_single_s19_still_syncs(mirror):
+    """The guard must not break the ordinary case."""
+    list_dir, get_file, _ = make_repo(['PART_A'])
+
+    result = mirror.sync(list_dir, get_file)
+
+    assert result['parts'] == ['PART_A']
+    assert result['skipped'] == []
+
+
+def test_root_s19_wins_over_src(mirror):
+    """A part root holding a .s19 is answered from there; src/ is not consulted,
+    so the same file appearing in both is not treated as ambiguous."""
+    def list_dir(sub):
+        if sub == '':
+            return [{'type': 'dir', 'name': 'PART_A'}]
+        if sub == 'PART_A':
+            return [{'type': 'file', 'name': 'firmware.s19'}]
+        if sub == 'PART_A/src':
+            return [{'type': 'file', 'name': 'firmware.s19'}]
+        raise FileNotFoundError(sub)
+
+    def get_file(path):
+        assert path == 'PART_A/firmware.s19', path
+        return {'content': base64.b64encode(S19.encode()).decode(), 'sha': 'x'}
+
+    result = mirror.sync(list_dir, get_file)
+
+    assert result['parts'] == ['PART_A']
+    assert result['skipped'] == []
+
+
 def test_resync_replaces_changed_firmware(mirror):
     list_dir, get_file, _ = make_repo(['1493X-V4'])
     mirror.sync(list_dir, get_file)

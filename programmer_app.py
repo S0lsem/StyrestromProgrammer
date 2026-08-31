@@ -703,6 +703,15 @@ class _DistributorAdminDialog(QDialog):
                 colour = '#c22'
             elif remaining < limit * 0.2:
                 colour = '#a60'
+        else:
+            # The server knows why it could not read the quota — show it. A bare
+            # "unavailable" reads as a harmless hiccup, when in practice it
+            # usually means the token is dead and the next Sync will fail.
+            quota = '  ' + (
+                github.get('reason')
+                or 'GitHub status could not be read.'
+            )
+            colour = '#c22'
         self._health.setStyleSheet(f'color: {colour}; font-size: 11px;')
         self._health.setText(served + quota)
 
