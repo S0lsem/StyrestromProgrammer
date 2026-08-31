@@ -50,7 +50,7 @@ from types import SimpleNamespace
 import fnmatch
 import re
 
-from mrs_protocol import admin_client, event_logger
+from mrs_protocol import admin_client, crashlog, event_logger
 
 
 _VERSION_NUMBER_RE = re.compile(r'\d+\.\d+(?:\.\d+)?')
@@ -1154,6 +1154,56 @@ class BatchListenerWorker(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Event reporter — posts flash events to HQ in a QThread
+# ---------------------------------------------------------------------------
+
+class _EventPostWorker(QObject):
+    """POST one flash event (or drain the offline queue) off the GUI thread.
+
+    ``report_event`` does a blocking ``urlopen`` with a 15 s timeout, and on
+    success it drains the pending queue too — one more blocking POST per
+    queued event. Called straight from a slot, as it used to be, that is a
+    multi-second freeze after every single flash; a queue built up during an
+    offline shift turns the next flash into a minutes-long hang, which Windows
+    files as AppHangB1 and the operator files as "it crashed".
+    """
+    done = pyqtSignal(str)   # one line for the log panel ('' = say nothing)
+
+    def __init__(self, event: Optional[dict]) -> None:
+        super().__init__()
+        self._event = event
+
+    def run(self) -> None:
+        try:
+            if self._event is None:
+                sent = event_logger.replay_pending()
+                self.done.emit(
+                    f'Replayed {sent} queued flash event(s) to HQ.' if sent else ''
+                )
+                return
+
+            response = event_logger.report_event(self._event)
+            if response is None:
+                self.done.emit(
+                    'Event queued offline (proxy unreachable); '
+                    'will retry on next launch.'
+                )
+                return
+
+            tag = (
+                'FIRST-TIME PROGRAM'
+                if response.get('first_program_for_sn') else
+                'reflash'
+            )
+            self.done.emit(
+                f'Event reported to HQ ({tag}) by '
+                f'{self._event["operator"]} @ {self._event["distributor"]}.'
+            )
+        except Exception as exc:   # noqa: BLE001 — reporting must never kill a flash
+            self.done.emit(f'Event reporting failed (flash itself was fine): {exc}')
+
+
+# ---------------------------------------------------------------------------
 # Flash worker — runs the CAN flash sequence in a QThread
 # ---------------------------------------------------------------------------
 
@@ -1252,6 +1302,13 @@ class MainWindow(QMainWindow):
         # this on every admin call, so the flag only decides what is shown.
         self._account_admin:     bool = False
         self._last_scan_label: str = ''   # carried into the flash event
+        # In-flight HQ event posts: (worker, thread) pairs held only so the
+        # Python GC cannot collect a QThread mid-run — Qt calls that fatal.
+        self._event_posts: set = set()
+        # Threads that would not stop in time at shutdown. Disowned from the
+        # window so Qt cannot destroy them, and kept here so the GC cannot
+        # either. Deliberately leaked: the process is on its way out.
+        self._abandoned: list = []
         # Once the operator acknowledges the first "Flash complete" popup
         # this session, suppress it on every later flash so batch mode is
         # not interrupted between units. Reports + CSV still get written.
@@ -1276,7 +1333,7 @@ class MainWindow(QMainWindow):
             return
 
         self._check_for_updates()
-        event_logger.replay_pending()
+        self._spawn_event_post(None)   # drain the offline queue in the background
 
     # ------------------------------------------------------------------
     # UI
@@ -1453,6 +1510,10 @@ class MainWindow(QMainWindow):
         log_layout = QVBoxLayout(log_box)
         self._log_edit = QTextEdit()
         self._log_edit.setReadOnly(True)
+        # Bound the scrollback the same way the CAN trace is bounded —
+        # an unbounded rich-text document is a slow leak across a long
+        # batch run, and every append re-lays-out the whole thing.
+        self._log_edit.document().setMaximumBlockCount(5000)
         self._log_edit.setFont(QFont('Courier New', 9))
         log_layout.addWidget(self._log_edit)
 
@@ -1528,6 +1589,7 @@ class MainWindow(QMainWindow):
     # CAN trace
     # ------------------------------------------------------------------
 
+    @crashlog.guard
     def _on_trace_frame(self, direction: str, arb_id: int, data: bytes) -> None:
         if not self._trace_record.isChecked():
             return
@@ -1757,6 +1819,7 @@ class MainWindow(QMainWindow):
         self._update_worker.result.connect(self._on_update_result)
         self._update_thread.start()
 
+    @crashlog.guard
     def _on_update_result(self, info: dict) -> None:
         self._update_thread.quit()
         if info.get('error'):
@@ -1828,6 +1891,7 @@ class MainWindow(QMainWindow):
     def _on_update_progress(self, fraction: float, message: str) -> None:
         self._update_banner.setText(f'{message} {int(fraction * 100)}%')
 
+    @crashlog.guard
     def _on_update_downloaded(self, path: str) -> None:
         from mrs_protocol import self_update
         self._update_banner.setText('Update downloaded — restarting…')
@@ -1878,6 +1942,7 @@ class MainWindow(QMainWindow):
         self._conn_worker.result.connect(self._on_conn_result)
         self._conn_thread.start()
 
+    @crashlog.guard
     def _on_conn_result(self, ok: bool, channel: str, msg: str) -> None:
         self._conn_thread.quit()
         self._check_conn_btn.setEnabled(True)
@@ -1921,6 +1986,7 @@ class MainWindow(QMainWindow):
         self._parts_worker.auth_required.connect(self._on_parts_auth_required)
         self._parts_thread.start()
 
+    @crashlog.guard
     def _on_parts_loaded(self, parts: list[str]) -> None:
         self._parts_thread.quit()
         self._refresh_btn.setEnabled(True)
@@ -1970,7 +2036,7 @@ class MainWindow(QMainWindow):
         self._append_log(f'Downloading part: {part}')
 
         self._dl_worker = DownloadWorker(part)
-        self._dl_thread = QThread()
+        self._dl_thread = QThread(self)
         self._dl_worker.moveToThread(self._dl_thread)
 
         self._dl_thread.started.connect(self._dl_worker.run)
@@ -1989,6 +2055,7 @@ class MainWindow(QMainWindow):
         self._progress_bar.setValue(int(fraction * 100))
         self._status_label.setText(message)
 
+    @crashlog.guard
     def _on_dl_done(self, firmware: Firmware) -> None:
         self._firmware = firmware
         self._loaded_part_name = self._part_combo.currentText()
@@ -1997,15 +2064,22 @@ class MainWindow(QMainWindow):
         self._refresh_btn.setEnabled(True)
         self._flash_btn.setEnabled(True)
         self._progress_bar.setValue(100)
-        self._status_label.setText(f'Firmware ready: {self._loaded_part_name}')
+        # Show the FW number the moment it lands, not after a flash — the
+        # operator needs to know which build is about to go onto the PLC
+        # while they can still change their mind.
+        version = self._firmware_version() or 'unknown'
+        self._status_label.setText(
+            f'Firmware ready: {self._loaded_part_name}   FW number: {version}'
+        )
         self._append_log(
-            f'Firmware loaded: {self._loaded_part_name} '
+            f'Firmware loaded: {self._loaded_part_name}  FW number: {version} '
             f'({len(firmware):,} bytes from 0x{firmware.start_address:04X})'
         )
         # If batch was already on when the user downloaded firmware, this
         # is the moment all preconditions become satisfied.
         self._maybe_start_batch_listener()
 
+    @crashlog.guard
     def _on_dl_error(self, msg: str) -> None:
         self._refresh_firmware_label()
         self._download_btn.setEnabled(True)
@@ -2090,7 +2164,7 @@ class MainWindow(QMainWindow):
             is_can_fd=cfg['can_fd'],
             data_bitrate=cfg['data_bitrate'],
         )
-        self._batch_thread = QThread()
+        self._batch_thread = QThread(self)
         self._batch_listener.moveToThread(self._batch_thread)
 
         self._batch_thread.started.connect(self._batch_listener.run)
@@ -2115,10 +2189,18 @@ class MainWindow(QMainWindow):
             f'Power-cycle the next module to start its flash.'
         )
 
+    @crashlog.guard
     def _on_batch_thread_finished(self) -> None:
-        """Drop Python refs once the thread has fully exited. Safe because
-        the connected bound-method slots captured the worker at connect time
-        and don't depend on self._batch_listener."""
+        """Drop Python refs once the thread has fully exited.
+
+        This is only safe because the QThread is parented to the window, so
+        Qt owns the C++ object and dropping our reference cannot destroy it.
+        Unparented, the wrapper owned it, and clearing the ref here killed
+        the app outright — ``finished`` is emitted while the thread is still
+        winding down, so the GC would delete a *running* QThread and Qt
+        answers that with qFatal(). Recorded 2026-08-31 19:59:23 as
+        "QThread: Destroyed while thread '' is still running", from this slot.
+        """
         self._batch_listener = None
         self._batch_thread = None
 
@@ -2135,6 +2217,7 @@ class MainWindow(QMainWindow):
         self._batch_listener = None
         self._batch_thread = None
 
+    @crashlog.guard
     def _on_batch_plc_detected(self, serial: int) -> None:
         # Ref cleanup happens via _on_batch_thread_finished — touching the
         # worker/thread refs here while signals are still in flight crashes
@@ -2142,14 +2225,48 @@ class MainWindow(QMainWindow):
         self._append_log(f'Auto-detected PLC SN {serial} on boot — starting flash.')
         self._on_flash()
 
+    @crashlog.guard
     def _on_batch_listener_error(self, msg: str) -> None:
         self._append_log(f'Batch listener stopped: {msg}')
         self._status_label.setText('Batch listener error — see log.')
 
     def closeEvent(self, event) -> None:   # noqa: N802 — Qt method name
         self._stop_batch_listener()
+        self._drain_threads()
+        self._wait_for_event_posts()
         super().closeEvent(event)
 
+    def _drain_threads(self, timeout_ms: int = 5000) -> None:
+        """Stop the worker threads before the window that owns them is destroyed.
+
+        Qt destroys child objects along with their parent, and destroying a
+        *running* QThread is a fatal — the crash recorded on 2026-08-31. So
+        every thread gets asked to stop first.
+
+        A scan cannot be cancelled (``scan_plc`` blocks with no stop flag), so
+        one may still be running when the timeout expires. Such a thread is
+        disowned rather than destroyed: leaking a thread in a process that is
+        exiting anyway costs nothing, and aborting the app in front of the
+        operator costs a great deal.
+        """
+        if self._flash_worker is not None:
+            try:
+                self._flash_worker.cancel()
+            except RuntimeError:
+                pass   # already deleted by Qt — nothing to cancel
+
+        for thread in (self._flash_thread, self._scan_thread, self._dl_thread):
+            if not self._thread_is_running(thread):
+                continue
+            try:
+                thread.quit()
+                if not thread.wait(timeout_ms):
+                    thread.setParent(None)
+                    self._abandoned.append(thread)
+            except RuntimeError:
+                pass
+
+    @crashlog.guard
     def _on_flash_thread_finished(self) -> None:
         """Drop Python refs once the flash thread has fully exited.
         Mirrors _on_batch_thread_finished — without it, ~20 rapid batch
@@ -2225,7 +2342,7 @@ class MainWindow(QMainWindow):
         )
 
         self._flash_worker = FlashWorker(firmware, retries=retries, net_baud=net_baud)
-        self._flash_thread = QThread()
+        self._flash_thread = QThread(self)
         self._flash_worker.moveToThread(self._flash_thread)
 
         self._flash_thread.started.connect(self._flash_worker.run)
@@ -2247,11 +2364,13 @@ class MainWindow(QMainWindow):
 
         self._flash_thread.start()
 
+    @crashlog.guard
     def _on_progress(self, fraction: float, message: str) -> None:
         self._progress_bar.setValue(int(fraction * 100))
         if message:
             self._status_label.setText(message)
 
+    @crashlog.guard
     def _on_plc_found(self, info) -> None:
         self._last_plc_info = info
         self._last_scan_label = info.label
@@ -2273,6 +2392,7 @@ class MainWindow(QMainWindow):
             self._flash_btn.setText(self._flash_prev_btn_text)
         self._flash_btn.setEnabled(True)
 
+    @crashlog.guard
     def _on_flash_cancelled(self) -> None:
         self._reset_flash_button()
         self._download_btn.setEnabled(True)
@@ -2280,6 +2400,7 @@ class MainWindow(QMainWindow):
         self._status_label.setText('Flash stopped')
         self._append_log('Flash stopped by operator.')
 
+    @crashlog.guard
     def _on_flash_done(self) -> None:
         self._reset_flash_button()
         self._download_btn.setEnabled(True)
@@ -2310,17 +2431,25 @@ class MainWindow(QMainWindow):
             else:
                 self._last_scan_label = f'wrote {wrote_version}'
 
-        # Write flash log
+        # Everything below is bookkeeping about a flash that has already
+        # succeeded, and each step is wrapped on its own: the CSV can be open
+        # in Excel, the reports folder can be read-only, the proxy can be
+        # down. One of those failing must not cost the other two — and must
+        # never reach the slot boundary, where an exception ends the process.
         from mrs_protocol.flash_log import write_entry
-        log_path = write_entry(
+        log_path = crashlog.attempt(
+            self, 'write the flash log', write_entry,
             part=part, module=module, channel=channel, success=True, serial=serial,
             sw_version=wrote_version,
             distributor=self._distributor(), operator=self._operator(),
         )
-        self._append_log(f'Flash logged to {log_path}')
+        if log_path:
+            self._append_log(f'Flash logged to {log_path}')
 
-        # Report event to the proxy (with offline fallback)
-        self._post_flash_event(
+        # Report event to the proxy (with offline fallback). The POST itself
+        # runs on its own thread — see _spawn_event_post.
+        crashlog.attempt(
+            self, 'report the flash to HQ', self._post_flash_event,
             plc_serial=serial,
             part=part,
             module=module,
@@ -2334,8 +2463,10 @@ class MainWindow(QMainWindow):
             part=part, module=module, channel=channel, serial=serial,
             sw_version=wrote_version,
         )
-        report_path = save_report(report)
-        self._append_log(f'Report saved to {report_path}')
+        report_path = crashlog.attempt(self, 'save the flash report',
+                                       save_report, report)
+        if report_path:
+            self._append_log(f'Report saved to {report_path}')
 
         # Show result only on the first successful flash of the session —
         # batch programming is hostile to a popup between every unit.
@@ -2358,8 +2489,12 @@ class MainWindow(QMainWindow):
                     'Text files (*.txt)',
                 )
                 if path:
-                    save_report(report, directory=Path(path).parent)
-                    self._append_log(f'Report saved to {path}')
+                    saved = crashlog.attempt(
+                        self, 'save the report to the chosen folder',
+                        save_report, report, directory=Path(path).parent,
+                    )
+                    if saved:
+                        self._append_log(f'Report saved to {path}')
 
         # Batch mode: keep firmware loaded, or clear it. When firmware stays
         # loaded, the batch listener is (re)started from
@@ -2371,6 +2506,7 @@ class MainWindow(QMainWindow):
             self._loaded_part_name = ''
             self._refresh_firmware_label()
 
+    @crashlog.guard
     def _on_flash_error(self, tb: str) -> None:
         self._reset_flash_button()
         self._download_btn.setEnabled(True)
@@ -2382,16 +2518,19 @@ class MainWindow(QMainWindow):
         info   = self._last_plc_info
         serial = str(info.serial) if info else ''
 
-        # Log the failure
+        # Log the failure. Same independence as the success path — a failed
+        # flash is exactly when the operator most needs the app to stay up.
         from mrs_protocol.flash_log import write_entry
-        write_entry(
+        crashlog.attempt(
+            self, 'write the flash log', write_entry,
             part=part, module=module, channel=self._detected_channel,
             success=False, error_msg=tb[:200],
             distributor=self._distributor(), operator=self._operator(),
         )
 
         # Report failure event to the proxy
-        self._post_flash_event(
+        crashlog.attempt(
+            self, 'report the failure to HQ', self._post_flash_event,
             plc_serial=serial,
             part=part,
             module=module,
@@ -2438,20 +2577,50 @@ class MainWindow(QMainWindow):
             error_message=error_message,
             scan_label=self._last_scan_label,
         )
-        response = event_logger.report_event(event)
-        if response is None:
-            self._append_log(
-                'Event queued offline (proxy unreachable); will retry on next launch.'
-            )
-        else:
-            tag = (
-                'FIRST-TIME PROGRAM'
-                if response.get('first_program_for_sn') else
-                'reflash'
-            )
-            self._append_log(
-                f'Event reported to HQ ({tag}) by {operator} @ {distributor}.'
-            )
+        self._spawn_event_post(event)
+
+    def _spawn_event_post(self, event: Optional[dict]) -> None:
+        """Fire-and-forget one event POST (or a queue drain) on its own thread."""
+        worker = _EventPostWorker(event)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.done.connect(self._on_event_posted)
+        worker.done.connect(thread.quit)
+        # Same cleanup order as the flash thread: drop our Python ref first,
+        # then let Qt destroy the C++ objects on the event loop.
+        pair = (worker, thread)
+        thread.finished.connect(lambda: self._event_posts.discard(pair))
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self._event_posts.add(pair)
+        thread.start()
+
+    @crashlog.guard
+    def _on_event_posted(self, message: str) -> None:
+        if message:
+            self._append_log(message)
+
+    def _wait_for_event_posts(self, timeout_ms: int = 3000) -> None:
+        """Let in-flight posts finish before the app exits.
+
+        A QThread still running when its C++ object is destroyed is a Qt fatal
+        — the abort would land on the way out, right after a good flash.
+        """
+        for _worker, thread in list(self._event_posts):
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    if not thread.wait(timeout_ms):
+                        # Still blocked on urlopen. Disown rather than let Qt
+                        # destroy a running thread — see _drain_threads.
+                        thread.setParent(None)
+                        self._abandoned.append(thread)
+            except RuntimeError:
+                pass   # already deleted by Qt — nothing left to wait for
+        self._event_posts.clear()
 
     # ------------------------------------------------------------------
     # Scan handlers
@@ -2500,7 +2669,7 @@ class MainWindow(QMainWindow):
             cfg['can_fd'],
             cfg['data_bitrate'],
         )
-        self._scan_thread = QThread()
+        self._scan_thread = QThread(self)
         self._scan_worker.moveToThread(self._scan_thread)
 
         self._scan_thread.started.connect(self._scan_worker.run)
@@ -2522,6 +2691,7 @@ class MainWindow(QMainWindow):
 
         self._scan_thread.start()
 
+    @crashlog.guard
     def _on_scan_thread_finished(self) -> None:
         """Drop scan refs once the scan thread has exited, then resume batch
         mode if it's still enabled (no-op otherwise)."""
@@ -2529,6 +2699,7 @@ class MainWindow(QMainWindow):
         self._scan_thread = None
         self._maybe_start_batch_listener()
 
+    @crashlog.guard
     def _on_scan_done(self, info) -> None:
         self._scan_btn.setEnabled(True)
         self._check_conn_btn.setEnabled(True)
@@ -2554,6 +2725,7 @@ class MainWindow(QMainWindow):
             self._append_log(f'  Description: {info.description}')
         self._append_log('Power-cycle the PLC again before clicking Flash.')
 
+    @crashlog.guard
     def _on_scan_partial(self, serial: int, msg: str) -> None:
         """The PLC was detected but its identity couldn't be read.
         Not a failure — the unit is present and flashable, so we present this
@@ -2569,6 +2741,7 @@ class MainWindow(QMainWindow):
         )
         QMessageBox.information(self, 'PLC detected — ready to flash', msg)
 
+    @crashlog.guard
     def _on_scan_error(self, msg: str) -> None:
         self._scan_btn.setEnabled(True)
         self._check_conn_btn.setEnabled(True)
@@ -2581,10 +2754,28 @@ class MainWindow(QMainWindow):
     # Helpers
     # ------------------------------------------------------------------
 
+    def _firmware_version(self) -> str:
+        """FW number of the loaded firmware, e.g. ``'0.37.0'``.
+
+        Read back out of the image rather than remembered alongside it —
+        ``_firmware`` is cleared in three different places, and a cached
+        string would eventually be shown against the wrong part.
+
+        Returns ``''`` when the image carries no version-shaped string;
+        callers render that as "unknown" rather than hiding it, so a
+        firmware we cannot read is visible instead of silently blank.
+        """
+        if self._firmware is None:
+            return ''
+        from mrs_protocol.s19_parser import extract_app_version
+        return _version_number(extract_app_version(self._firmware.data))
+
     def _refresh_firmware_label(self) -> None:
         if self._firmware is not None:
+            version = self._firmware_version() or 'unknown'
             self._firmware_label.setText(
                 f'Loaded: {self._loaded_part_name}  '
+                f'FW number: {version}  '
                 f'({len(self._firmware):,} bytes)'
             )
             self._firmware_label.setStyleSheet('color: #2a2; font-weight: bold;')
@@ -2634,6 +2825,11 @@ def _app_icon_path() -> Optional[Path]:
 
 
 def main() -> None:
+    # Before anything Qt: an exception escaping a slot makes PyQt6 abort the
+    # process, and with console=False that traceback goes to a dead stderr.
+    # This turns those silent deaths into ~/.mrs_programmer/logs/crash.log.
+    crashlog.install()
+
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     _icon = _app_icon_path()
