@@ -82,6 +82,22 @@ try {
     # 404 = good, it does not exist yet.
 }
 
+# --- Guard: is the exe we are about to overwrite running? -------------------
+# PyInstaller only discovers this at the very end, after several minutes of
+# building, and fails with a bare "PermissionError: [WinError 5]". Testing the
+# previous build while cutting the next one is a completely normal thing to be
+# doing, so check up front and say so plainly.
+Step "Checking $ExeName is not running"
+$Running = Get-Process -Name ([System.IO.Path]::GetFileNameWithoutExtension($ExeName)) -ErrorAction SilentlyContinue
+if ($Running) {
+    $pids = ($Running | ForEach-Object { $_.Id }) -join ', '
+    throw ("$ExeName is running (PID $pids) and PyInstaller cannot overwrite it. " +
+           "Close the programmer and run this again. Do not force-kill it if a " +
+           "flash is in progress -- that stops the console flasher with a PLC " +
+           "part-written.")
+}
+Write-Host "  not running - safe to overwrite."
+
 # --- 1. Bump version.py -----------------------------------------------------
 Step "Bumping version.py to $Version"
 $VersionPy = Join-Path $PSScriptRoot 'mrs_protocol\version.py'
