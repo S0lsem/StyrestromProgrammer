@@ -73,9 +73,12 @@ if ($Assets -notmatch [regex]::Escape($ExeName)) {
     throw "Release $Tag has no $ExeName asset. Refusing to promote - distributors would see an update they cannot download."
 }
 
+# Deliberately not short-circuiting when prerelease is already false: the flag
+# and the "latest" pointer are separate pieces of state, and a half-finished
+# promotion leaves the first cleared while the second still points elsewhere.
+# Re-running must be able to finish the job.
 if (-not $Release.prerelease) {
-    Write-Host "`n$Tag is already promoted. Nothing to do." -ForegroundColor Green
-    return
+    Write-Host "  already flagged as a full release - will re-assert it as latest." -ForegroundColor Yellow
 }
 
 # --- Promote ----------------------------------------------------------------
@@ -84,7 +87,13 @@ if (-not $PSCmdlet.ShouldProcess("$Tag", "clear the prerelease flag (offer it to
 }
 
 Step "Promoting $Tag to all distributors"
-$Body = @{ prerelease = $false } | ConvertTo-Json
+# make_latest matters as much as prerelease. GitHub stores which release is
+# "latest" rather than deriving it on every request, and clearing the
+# prerelease flag alone does not reliably recompute it -- v1.0.19 sat as the
+# newest non-draft, non-prerelease release while /releases/latest still served
+# v1.0.17, for minutes, on authenticated requests too. Setting make_latest
+# says it outright instead of hoping GitHub works it out.
+$Body = @{ prerelease = $false; make_latest = 'true' } | ConvertTo-Json
 Invoke-RestMethod -Method Patch -Headers $Headers -ContentType 'application/json' `
     -Uri "https://api.github.com/repos/$RepoOwner/$RepoName/releases/$($Release.id)" `
     -Body $Body | Out-Null
