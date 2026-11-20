@@ -33,7 +33,9 @@ from dataclasses import dataclass
 # ``APPL_VERSION`` in Dsl_cfg.h), so we can recover the version we just wrote
 # by searching the parsed firmware bytes for that pattern — without having
 # to power-cycle the PLC and re-SCAN.
-_APP_VERSION_RE = re.compile(rb'V\s*:?\s*(\d+\.\d+\.\d+)')
+# A G right after the V is kept: the 1493X gesture build marks itself
+# ``GVG0.55.0`` (V4 is ``GV0.55.0``), so it shows as ``G0.55.0``.
+_APP_VERSION_RE = re.compile(rb'V\s*:?\s*(G?\d+\.\d+\.\d+)')
 
 
 def extract_app_version(data: bytes) -> str:

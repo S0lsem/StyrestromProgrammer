@@ -363,3 +363,23 @@ class TestFirmwareCache:
         # Any cache touch should remove the legacy file.
         firmware_cache.list_cached_parts()
         assert not legacy.exists()
+
+
+# ---------------------------------------------------------------------------
+# extract_app_version — the FW number shown after a download
+# ---------------------------------------------------------------------------
+
+class TestAppVersion:
+    """V4 marks its image ``GV0.55.0``; the gesture build ``GVG0.55.0`` and
+    must show as G0.55.0, whatever number the next car table brings."""
+
+    @pytest.mark.parametrize('image, expected', [
+        (b'\xff500 kBit;GV0.55.0   \x00', 'V: 0.55.0'),
+        (b'\xff500 kBit;GVG0.55.0   \x00', 'V: G0.55.0'),
+        (b'\xff500 kBit;GVG0.56.0   \x00', 'V: G0.56.0'),
+        (b'Modul V: 0.17.0', 'V: 0.17.0'),
+        (b'3----V0.1 no full version', ''),
+    ])
+    def test_version(self, image, expected):
+        from mrs_protocol.s19_parser import extract_app_version
+        assert extract_app_version(image) == expected
