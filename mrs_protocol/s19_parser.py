@@ -33,9 +33,11 @@ from dataclasses import dataclass
 # ``APPL_VERSION`` in Dsl_cfg.h), so we can recover the version we just wrote
 # by searching the parsed firmware bytes for that pattern — without having
 # to power-cycle the PLC and re-SCAN.
-# A G right after the V is kept: the 1493X gesture build marks itself
-# ``GVG0.55.0`` (V4 is ``GV0.55.0``), so it shows as ``G0.55.0``.
-_APP_VERSION_RE = re.compile(rb'V\s*:?\s*(G?\d+\.\d+\.\d+)')
+# Up to four capital letters right after the V (optional ':' and spaces on
+# either side) are kept: the 1493X gesture build ``GVG0.55.0`` shows as
+# ``G0.55.0``, CAN FD autobaud ``V: AB1.3.0`` as ``AB1.3.0`` and
+# ``V: ABH: 2.0.0`` as ``ABH2.0.0``. V4's ``GV0.55.0`` stays ``0.55.0``.
+_APP_VERSION_RE = re.compile(rb'V\s*:?\s*([A-Z]{0,4})\s*:?\s*(\d+\.\d+\.\d+)')
 
 
 def extract_app_version(data: bytes) -> str:
@@ -45,7 +47,7 @@ def extract_app_version(data: bytes) -> str:
     m = _APP_VERSION_RE.search(data)
     if not m:
         return ''
-    return f'V: {m.group(1).decode("ascii")}'
+    return f'V: {m.group(1).decode("ascii")}{m.group(2).decode("ascii")}'
 
 
 class S19ParseError(ValueError):

@@ -378,6 +378,9 @@ class TestAppVersion:
         (b'\xff500 kBit;GVG0.55.0   \x00', 'V: G0.55.0'),
         (b'\xff500 kBit;GVG0.56.0   \x00', 'V: G0.56.0'),
         (b'Modul V: 0.17.0', 'V: 0.17.0'),
+        (b'\x00V: AB1.3.0          \x00', 'V: AB1.3.0'),
+        (b'\x00V: ABH: 2.0.0       \x00', 'V: ABH2.0.0'),
+        (b'\x00V 01.20.0\x00', 'V: 01.20.0'),
         (b'3----V0.1 no full version', ''),
     ])
     def test_version(self, image, expected):

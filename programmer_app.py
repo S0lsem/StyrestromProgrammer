@@ -53,16 +53,21 @@ import re
 from mrs_protocol import admin_client, crashlog, event_logger
 
 
-_VERSION_NUMBER_RE = re.compile(r'(?:(?<=V)G|(?<=V: )G)?\d+\.\d+(?:\.\d+)?')
+_VERSION_NUMBER_RE = re.compile(r'\d+\.\d+(?:\.\d+)?')
+_LETTERED_VERSION_RE = re.compile(r'V\s*:?\s*([A-Z]{1,4})\s*:?\s*(\d+\.\d+(?:\.\d+)?)')
 
 
 def _version_number(text: str) -> str:
     """Pull the bare ``X.Y`` / ``X.Y.Z`` digits out of strings like
     ``'V: 0.17.0'``, ``'----V0.1'``, or ``'0.17.0'``. Returns '' for empty
-    or unparseable input. A G right after the V is kept, so the 1493X
-    gesture build (``GVG0.55.0`` / ``'V: G0.55.0'``) reads ``G0.55.0``."""
+    or unparseable input. Up to four capital letters right after the V are
+    kept, so ``GVG0.55.0`` reads ``G0.55.0``, ``V: AB1.3.0`` reads
+    ``AB1.3.0`` and ``V: ABH: 2.0.0`` reads ``ABH2.0.0``."""
     if not text:
         return ''
+    m = _LETTERED_VERSION_RE.search(text)
+    if m:
+        return m.group(1) + m.group(2)
     m = _VERSION_NUMBER_RE.search(text)
     return m.group(0) if m else ''
 
