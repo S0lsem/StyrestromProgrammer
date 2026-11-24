@@ -55,7 +55,9 @@ $Tag       = "v$Version"
 function Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 
 # --- Locate Python (the one with the build deps installed) ------------------
-$Python = "C:\Users\erlen\AppData\Local\Programs\Python\Python313\python.exe"
+# Set STYRESTROM_PYTHON to build with a different interpreter (another PC).
+$Python = $env:STYRESTROM_PYTHON
+if (-not $Python) { $Python = "C:\Users\erlen\AppData\Local\Programs\Python\Python313\python.exe" }
 if (-not (Test-Path $Python)) { $Python = 'py' }
 
 # --- Read the GitHub token (never printed) ----------------------------------
