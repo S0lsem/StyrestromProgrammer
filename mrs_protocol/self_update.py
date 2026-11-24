@@ -21,8 +21,9 @@ from pathlib import Path
 from typing import Callable, Optional
 from urllib.request import Request, urlopen
 
-# CreateProcess flags — keep the helper alive after the app (its parent) dies.
-_DETACHED_PROCESS        = 0x00000008
+# CreateProcess flags — keep the helper alive after the app (its parent) dies,
+# without flashing a console window.
+_CREATE_NO_WINDOW         = 0x08000000
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 
@@ -77,21 +78,32 @@ def download_update(
     return dest
 
 
-# Waits for our PID to disappear, swaps the exe, relaunches, self-deletes.
-# tasklist's /fi PID filter prints "INFO: No tasks..." (which lacks the PID)
-# once we exit, so `find "%PID%"` then fails and we fall through.
+# Swaps the exe once we have exited, relaunches, self-deletes.
+#
+# Windows will not replace an exe while any process still runs it, so the
+# move itself is the "has the app exited?" test: retry it once a second until
+# it succeeds. That also waits out PyInstaller's onefile launcher, which holds
+# the exe for a moment after the Python process has gone.
+#
+# Do not go back to polling `tasklist /fi "PID eq ..." | find "..."`: spawned
+# from the windowed exe, `find` never saw the end of its input and hung, so
+# the swap never ran and the app never came back (v1.0.19 -> v1.0.20).
+#
+# After ~2 minutes it gives up and relaunches whatever is there, so the user
+# is never left without a programmer.
 _UPDATER_BAT = """@echo off
 setlocal
-set "PID={pid}"
 set "SRC={src}"
 set "DST={dst}"
-:wait
-tasklist /fi "PID eq %PID%" 2>nul | find "%PID%" >nul
-if not errorlevel 1 (
-    ping -n 2 127.0.0.1 >nul
-    goto wait
-)
-move /y "%SRC%" "%DST%" >nul
+set /a TRIES=0
+:retry
+move /y "%SRC%" "%DST%" >nul 2>&1
+if not errorlevel 1 goto launch
+set /a TRIES+=1
+if %TRIES% geq 120 goto launch
+ping -n 2 127.0.0.1 >nul
+goto retry
+:launch
 start "" "%DST%"
 endlocal
 (goto) 2>nul & del "%~f0"
@@ -124,12 +136,32 @@ def install_and_restart(new_exe: Path) -> None:
     os.close(fd)
     bat_path = Path(bat_str)
     bat_path.write_text(
-        _UPDATER_BAT.format(pid=os.getpid(), src=str(new_exe), dst=str(target)),
+        _UPDATER_BAT.format(src=str(new_exe), dst=str(target)),
         encoding='ascii',
     )
 
+    # A windowed exe has no usable std handles to pass on, so give the helper
+    # its own (DEVNULL) and a hidden console for the commands it runs.
     subprocess.Popen(
         ['cmd', '/c', str(bat_path)],
-        creationflags=_DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP,
+        creationflags=_CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         close_fds=True,
+        env=_fresh_app_env(),
     )
+
+
+def _fresh_app_env() -> dict:
+    """Our environment, minus PyInstaller's onefile bookkeeping.
+
+    The onefile launcher tells its Python process where it unpacked itself
+    through ``_PYI_*`` variables (``_MEIPASS2`` before PyInstaller 6). Passed
+    on to the relaunched exe, they make it reuse our ``_MEI...`` folder,
+    which is deleted as we exit: "Failed to load Python DLL ... python312.dll".
+    """
+    env = {k: v for k, v in os.environ.items()
+           if not k.upper().startswith('_PYI_') and k.upper() != '_MEIPASS2'}
+    env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    return env
